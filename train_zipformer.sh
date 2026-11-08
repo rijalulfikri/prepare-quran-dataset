@@ -18,7 +18,9 @@
 #   TORCH_INDEX_URL  default: https://download.pytorch.org/whl/cu128
 #   AUTO_RESTART=1   ulangi training (maks 3x, jeda 60 dtk) jika crash dengan
 #                    exit code selain 0/143 (CUDA/NCCL/data-loader sementara);
-#                    tidak menolong jika box-nya sendiri mati.
+#                    tidak menolong jika box-nya sendiri mati. PERHATIAN: kegagalan
+#                    deterministik (config salah, parity assertion ONNX) juga
+#                    diulang; baca log sebelum mengandalkan AUTO_RESTART.
 #   Argumen tambahan diteruskan ke train_zipformer.py, mis.:
 #     bash train_zipformer.sh --push-to-hub
 # ==============================================================================
@@ -103,6 +105,12 @@ fi
 
 echo "Mengambil submodule icefall..."
 git submodule update --init external/icefall
+
+echo "Cek import modul training & qdat_bench..."
+if ! python -c "import prepare_quran_dataset.zipformer.qdat, prepare_quran_dataset.zipformer.train_loop, prepare_quran_dataset.modeling_streaming_rnn.multi_level_tokenizer, qdat_bench.eval_results"; then
+    echo "ERROR: import gagal (lihat traceback di atas); ada dependency yang belum terinstall."
+    exit 1
+fi
 
 # ------------------------------------------------------------------------------
 # 2. Rclone (Google Drive): data + backup checkpoint
@@ -189,4 +197,8 @@ echo "  Hasil test : $OUTPUT_DIR/test_results.json"
 echo "  qdat_bench : $OUTPUT_DIR/qdat_bench_test_results.json"
 echo "============================================================"
 echo "Anda dapat mendownload model ini ke komputer lokal menggunakan scp:"
-echo "scp -P <PORT> -r root@<IP_VAST_AI>:$PWD/${EXPORT_DIR#./} ./"
+case "$EXPORT_DIR" in
+    /*) EXPORT_ABS="$EXPORT_DIR" ;;
+    *) EXPORT_ABS="$PWD/${EXPORT_DIR#./}" ;;
+esac
+echo "scp -P <PORT> -r root@<IP_VAST_AI>:$EXPORT_ABS ./"

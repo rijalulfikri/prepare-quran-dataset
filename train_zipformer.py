@@ -135,11 +135,15 @@ def _parity_wavs(cfg) -> list:
 
     wavs = []
     for cut in load_cuts(Path(cfg.data_dir), "test"):
-        if (cut.supervisions[0].custom or {}).get("input_type") == "silence":
+        if not cut.supervisions or (cut.supervisions[0].custom or {}).get("input_type") == "silence":
             continue
         wavs.append(cut.load_audio()[0])
         if len(wavs) == N_PARITY_WAVS:
             break
+    if not wavs:
+        raise RuntimeError(f"no speech cuts in the test split of {cfg.data_dir}; cannot check ONNX parity")
+    if len(wavs) < N_PARITY_WAVS:
+        log.warning("only %d test speech cuts for the ONNX parity check (wanted %d)", len(wavs), N_PARITY_WAVS)
     return wavs
 
 

@@ -537,7 +537,7 @@ bash train_zipformer.sh
 
 `train_zipformer.sh` melakukan, dan semua langkahnya idempotent:
 
-1. Membuat `.venv-zipformer` (Python 3.14; fallback 3.12 dengan `PYTHONPATH=src` jika wheel k2 untuk cp314 tidak ada), menginstall torch 2.9.1, k2 (`K2_WHEEL_URL`, pilih wheel di https://k2-fsa.github.io/k2/cuda.html), `requirements-zipformer.txt`, `pip install -e .`, dan submodule `external/icefall`.
+1. Membuat `.venv-zipformer` (Python 3.14; fallback 3.12 dengan `PYTHONPATH=src` jika wheel k2 untuk cp314 tidak ada), menginstall torch 2.9.1, k2 (`K2_WHEEL_URL`, pilih wheel di https://k2-fsa.github.io/k2/cuda.html), `requirements-zipformer.txt`, `pip install -e .` (hanya di Python 3.14; fallback 3.12 memakai `PYTHONPATH=src` karena `pyproject.toml` mensyaratkan Python >=3.14), cek import modul training/qdat_bench (gagal dalam hitungan menit jika ada dependency yang kurang), dan submodule `external/icefall`.
 2. Menginstall rclone jika belum ada, menolak jalan tanpa `rclone.conf` (`~/.config/rclone/rclone.conf` atau `RCLONE_CONFIG`), cek koneksi (`rclone lsd`), dan menampilkan isi folder checkpoint Drive (`rclone lsl <rclone_checkpoint_path>`) supaya terlihat apa yang akan di-resume.
 3. `python train_zipformer.py --config configs/train/zipformer/train_config.yml --stage all "$@"`. Dengan `AUTO_RESTART=1`, crash dengan exit code selain 0/143 diulang maksimal 3 kali dengan jeda 60 detik (untuk error CUDA/NCCL/data-loader sementara; tidak menolong jika box-nya mati).
 4. Menampilkan path hasil export dan contoh perintah `scp`.

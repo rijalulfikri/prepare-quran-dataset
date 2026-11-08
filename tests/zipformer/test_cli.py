@@ -1,4 +1,8 @@
 # tests/zipformer/test_cli.py
+import types
+
+import pytest
+
 import train_zipformer as tz
 
 
@@ -47,3 +51,34 @@ def test_train_interrupted_exits_143(monkeypatch):
 
     monkeypatch.setattr(tz, "stage_train", interrupted)
     assert tz.main(["--stage", "train", "--device", "cpu"]) == 143
+
+
+class _Sup:
+    def __init__(self, input_type):
+        self.custom = {"input_type": input_type}
+
+
+class _Cut:
+    def __init__(self, supervisions):
+        self.supervisions = supervisions
+
+    def load_audio(self):
+        return [[0.0]]
+
+
+def _parity_wavs_over(monkeypatch, cuts):
+    from prepare_quran_dataset.zipformer import datamodule
+
+    monkeypatch.setattr(datamodule, "load_cuts", lambda data_dir, split: cuts)
+    return tz._parity_wavs(types.SimpleNamespace(data_dir="d"))
+
+
+def test_parity_wavs_without_speech_cuts_raises(monkeypatch):
+    with pytest.raises(RuntimeError, match="no speech cuts"):
+        _parity_wavs_over(monkeypatch, [_Cut([]), _Cut([_Sup("silence")])])
+
+
+def test_parity_wavs_skips_silence_and_unsupervised_cuts(monkeypatch, caplog):
+    wavs = _parity_wavs_over(monkeypatch, [_Cut([]), _Cut([_Sup("silence")]), _Cut([_Sup("speech")])])
+    assert len(wavs) == 1
+    assert "only 1 test speech cuts" in caplog.text
