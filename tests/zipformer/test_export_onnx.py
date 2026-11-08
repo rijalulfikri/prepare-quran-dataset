@@ -37,3 +37,19 @@ def test_metadata_survives_int8(tmp_path, tiny_model, tokens):
         assert md["model_type"] == "zipformer2"
         assert md["output_frame_shift_ms"] == "20"
         assert md["subsampling_factor"] == "2"
+
+
+def test_decoder_refuses_model_without_frame_shift(tmp_path, tiny_model, tokens):
+    import onnx
+
+    paths = ex.export_streaming_onnx(
+        tiny_model, tmp_path, tokens, chunk_size=8, left_context=32, output_downsampling_factor=1
+    )
+    m = onnx.load(str(paths["fp32"]))
+    kept = [p for p in m.metadata_props if p.key != "output_frame_shift_ms"]
+    del m.metadata_props[:]
+    m.metadata_props.extend(kept)
+    stripped = tmp_path / "stripped.onnx"
+    onnx.save(m, str(stripped))
+    with pytest.raises(ValueError, match="output_frame_shift_ms"):
+        ex.OnnxStreamingDecoder(stripped)
