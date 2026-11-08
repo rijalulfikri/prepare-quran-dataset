@@ -100,3 +100,29 @@ def cfg():
         min_noise_input_seconds=1.0,
         max_noise_input_seconds=2.0,
     )
+
+
+@pytest.fixture
+def make_cut_in_memory():
+    """Factory: `MonoCut` over an in-memory 16 kHz recording of zeros with one
+    supervision spanning the cut (`custom={"input_type": ...}`)."""
+    import io
+
+    import numpy as np
+    import soundfile as sf
+    from lhotse import MonoCut, Recording, SupervisionSegment
+
+    def _make(id, duration, text, input_type="speech"):
+        buf = io.BytesIO()
+        sf.write(buf, np.zeros(round(duration * 16000), dtype="float32"), 16000, format="WAV")
+        rec = Recording.from_bytes(buf.getvalue(), recording_id=id)
+        sup = SupervisionSegment(
+            id=id, recording_id=id, start=0.0, duration=rec.duration,
+            text=text, custom={"input_type": input_type},
+        )
+        return MonoCut(
+            id=id, start=0.0, duration=rec.duration, channel=0,
+            recording=rec, supervisions=[sup],
+        )
+
+    return _make
