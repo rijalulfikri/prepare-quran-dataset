@@ -81,3 +81,10 @@ def base_attrs(moshaf_6_0_dict):
 @pytest.fixture
 def special_attrs(moshaf_6_0_dict):
     return mw.build_special_moshaf_attrs({"6.0": moshaf_6_0_dict})
+
+
+@pytest.fixture
+def tokens():
+    from prepare_quran_dataset.zipformer.tokens import PhonemeTokens
+
+    return PhonemeTokens.from_vocab_json("vocab_streaming/vocab.json")
