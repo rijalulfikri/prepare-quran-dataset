@@ -183,3 +183,28 @@ def test_newer_batch_replaces_pending_batch_but_not_epoch(tmp_path, remote):
     assert uploaded == {"checkpoint-2000.pt", "epoch-1.pt", "checkpoint-6000.pt"}
     assert not any("checkpoint-4000" in p for p in copied)
     assert bk.last_error is None
+
+
+def test_pending_paths_reports_queued_and_in_flight_then_empty(tmp_path, remote):
+    src = tmp_path / "src"
+    src.mkdir()
+    bk = DriveBackup(remote, keep_last_k=10, timeout=60)
+    real_copyto = bk._rclone.copyto
+    gate = threading.Event()
+    started = threading.Event()
+
+    def gated_copyto(src_path, dst, timeout):
+        started.set()
+        assert gate.wait(30)
+        real_copyto(src_path, dst, timeout)
+
+    bk._rclone.copyto = gated_copyto
+    _save(src, "batch", 2000, 1)
+    _save(src, "epoch", 3000, 1)
+    bk.submit(src / "checkpoint-2000.pt")
+    assert started.wait(30)  # checkpoint-2000 is in flight
+    bk.submit(src / "epoch-1.pt")  # queued behind it
+    assert bk.pending_paths() == {src / "checkpoint-2000.pt", src / "epoch-1.pt"}
+    gate.set()
+    assert bk.flush(60)
+    assert bk.pending_paths() == set()

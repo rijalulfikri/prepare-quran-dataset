@@ -20,6 +20,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass
+from collections.abc import Collection
 from pathlib import Path
 from typing import Literal
 
@@ -184,14 +185,18 @@ def _unlink(path: Path, deleted: list[Path]) -> None:
         pass
 
 
-def prune(dir: Path, keep_last_k: int) -> list[Path]:
+def prune(dir: Path, keep_last_k: int, protect: Collection[Path] = ()) -> list[Path]:
     """Per kind keep the newest ``keep_last_k`` complete checkpoints; return deleted paths.
+
+    ``.pt`` files in ``protect`` (e.g. still pending upload) and their metas are
+    never deleted; they do not count towards ``keep_last_k``.
 
     Also removes ``*.tmp`` leftovers and ``.pt`` files lacking a valid meta whose
     name number is older than the newest complete checkpoint of the same kind.
     Meta-less ``.pt`` files newer than that are left alone (possibly being written).
     """
     dir = Path(dir)
+    protected = {Path(p).name for p in protect}
     deleted: list[Path] = []
     for tmp in dir.glob("*.tmp"):
         _unlink(tmp, deleted)
@@ -204,12 +209,14 @@ def prune(dir: Path, keep_last_k: int) -> list[Path]:
             continue
         drop = of_kind[: max(len(of_kind) - keep_last_k, 0)]
         for pt, _ in drop:
+            if pt.name in protected:
+                continue
             _unlink(pt, deleted)
             _unlink(meta_path(pt), deleted)
         newest_number = name_number(of_kind[-1][1])
         for pt in dir.glob("*.pt"):
             parsed = parse_name(pt.name)
-            if parsed is None or pt.name in complete_names:
+            if parsed is None or pt.name in complete_names or pt.name in protected:
                 continue
             pkind, number = parsed
             if pkind == kind and number < newest_number:

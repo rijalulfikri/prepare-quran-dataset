@@ -90,7 +90,7 @@ class DriveBackup:
         self._rclone = rclone or Rclone()
         self.last_error: str | None = None
         self._pending: list[tuple[Path, bool]] = []  # (pt, is_batch)
-        self._in_flight = False
+        self._in_flight: Path | None = None
         self._cond = threading.Condition()
         self._worker = threading.Thread(target=self._run, name="drive-backup", daemon=True)
         self._worker.start()
@@ -114,14 +114,22 @@ class DriveBackup:
     def flush(self, timeout: float) -> bool:
         """Wait until nothing is pending or in flight; ``False`` on timeout."""
         with self._cond:
-            return self._cond.wait_for(lambda: not self._pending and not self._in_flight, timeout=timeout)
+            return self._cond.wait_for(lambda: not self._pending and self._in_flight is None, timeout=timeout)
+
+    def pending_paths(self) -> set[Path]:
+        """``.pt`` paths queued or being uploaded (must not be pruned locally)."""
+        with self._cond:
+            paths = {pt for pt, _ in self._pending}
+            if self._in_flight is not None:
+                paths.add(self._in_flight)
+            return paths
 
     def _run(self) -> None:
         while True:
             with self._cond:
                 self._cond.wait_for(lambda: bool(self._pending))
                 pt, _ = self._pending.pop(0)
-                self._in_flight = True
+                self._in_flight = pt
             try:
                 self._upload(pt)
             except Exception as exc:  # noqa: BLE001 - the backup must never kill training
@@ -129,7 +137,7 @@ class DriveBackup:
                 log.warning("drive backup of %s failed: %s", pt, exc)
             finally:
                 with self._cond:
-                    self._in_flight = False
+                    self._in_flight = None
                     self._cond.notify_all()
 
     def _upload(self, pt: Path) -> None:

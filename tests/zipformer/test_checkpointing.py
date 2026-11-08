@@ -127,3 +127,20 @@ def test_dump_cli(tmp_path):
 
     b = run(bare)
     assert b["batch_idx_train"] is None and b["lrs"] == [] and b["optimizer_sha256"] is None
+
+
+def test_prune_never_deletes_protected(tmp_path):
+    for b in (2000, 4000, 6000, 8000):
+        _save(tmp_path, "batch", b, 1, b)
+    protected = tmp_path / "checkpoint-2000.pt"  # e.g. still pending upload
+    deleted = ck.prune(tmp_path, keep_last_k=2, protect={protected})
+    assert protected.exists() and ck.meta_path(protected).exists()
+    assert protected not in deleted
+    assert sorted(p.name for p in tmp_path.glob("checkpoint-*.pt")) == [
+        "checkpoint-2000.pt",
+        "checkpoint-6000.pt",
+        "checkpoint-8000.pt",
+    ]
+    (tmp_path / "checkpoint-1000.pt").write_bytes(b"meta-less, older, pending")
+    ck.prune(tmp_path, keep_last_k=2, protect=[tmp_path / "checkpoint-1000.pt"])
+    assert (tmp_path / "checkpoint-1000.pt").exists()
