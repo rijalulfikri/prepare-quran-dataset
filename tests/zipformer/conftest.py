@@ -181,3 +181,51 @@ def tiny_data_dir(tmp_path_factory):
 def tiny_data_dir_big(tmp_path_factory):
     """Same layout with 60 one-second cuts, so an epoch at `max_duration=4` has >= 10 batches."""
     return _build_data_dir(tmp_path_factory.mktemp("tiny_data_big"), num_speech=59, seconds=1)
+
+
+TINY_MODEL_DIMS = dict(
+    num_encoder_layers="1,1",
+    downsampling_factor="1,2",
+    feedforward_dim="64,64",
+    num_heads="2,2",
+    encoder_dim="32,32",
+    encoder_unmasked_dim="32,32",
+    cnn_module_kernel="7,7",
+    query_head_dim="8",
+    value_head_dim="4",
+    pos_head_dim="4",
+    pos_dim=16,
+    chunk_size="8",
+    left_context_frames="32",
+    export_chunk_size=8,
+    train_moshaf_ids=["6.0"],
+    test_moshaf_ids=[],
+    output_downsampling_factor=1,
+)
+
+
+@pytest.fixture
+def tiny_cfg_factory():
+    """Factory: tiny-dims `ZipformerTrainConfig` (cheap CPU model) with overrides."""
+    from prepare_quran_dataset.zipformer.config import ZipformerTrainConfig
+
+    def _make(**overrides):
+        return ZipformerTrainConfig(**{**TINY_MODEL_DIMS, **overrides})
+
+    return _make
+
+
+@pytest.fixture
+def make_tiny_model(tiny_cfg_factory):
+    """Factory: a fresh tiny Zipformer2-CTC `AsrModel` (vocab 44, 20 ms frames)."""
+    from prepare_quran_dataset.zipformer.model import build_model
+
+    def _make(**overrides):
+        return build_model(tiny_cfg_factory(**overrides), vocab_size=44)
+
+    return _make
+
+
+@pytest.fixture
+def tiny_model(make_tiny_model):
+    return make_tiny_model()
