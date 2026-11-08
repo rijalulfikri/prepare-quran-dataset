@@ -88,3 +88,15 @@ def tokens():
     from prepare_quran_dataset.zipformer.tokens import PhonemeTokens
 
     return PhonemeTokens.from_vocab_json("vocab_streaming/vocab.json")
+
+
+@pytest.fixture
+def cfg():
+    from prepare_quran_dataset.zipformer.config import ZipformerTrainConfig
+
+    return ZipformerTrainConfig(
+        train_moshaf_ids=["6.0"],
+        test_moshaf_ids=["19.0"],
+        min_noise_input_seconds=1.0,
+        max_noise_input_seconds=2.0,
+    )
