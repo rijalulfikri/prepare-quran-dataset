@@ -128,9 +128,11 @@ def make_cut_in_memory():
     return _make
 
 
-def _build_data_dir(root, num_speech, seconds):
+def _build_data_dir(root, num_speech, seconds, speech_specs=None):
     """Data dir in Task 4's layout: `seconds`-long FLACs under `root/audio/...` and
-    `cuts_{train,dev,noise_aug}.jsonl.gz` manifests with relative paths."""
+    `cuts_{train,dev,noise_aug}.jsonl.gz` manifests with relative paths.
+
+    `speech_specs` (list of `(seconds, text)`) replaces the default speech cuts."""
     import io
 
     import numpy as np
@@ -140,9 +142,9 @@ def _build_data_dir(root, num_speech, seconds):
 
     rng = np.random.default_rng(0)
 
-    def flac(rel):
+    def flac(rel, secs=seconds):
         # low-amplitude sine + noise (not silence) so fbank is well-defined
-        n = seconds * 16000
+        n = round(secs * 16000)
         t = np.arange(n) / 16000
         wav = 0.1 * np.sin(2 * np.pi * rng.uniform(100, 400) * t)
         wav += 0.01 * rng.standard_normal(n)
@@ -150,12 +152,14 @@ def _build_data_dir(root, num_speech, seconds):
         sf.write(buf, wav.astype("float32"), 16000, format="WAV")
         return write_flac(buf.getvalue(), root / rel)
 
-    def cut(rel, text, cut_id, input_type):
-        return make_cut(rel, flac(rel), text, cut_id, {"input_type": input_type}, root)
+    def cut(rel, text, cut_id, input_type, secs=seconds):
+        return make_cut(rel, flac(rel, secs), text, cut_id, {"input_type": input_type}, root)
 
+    if speech_specs is None:
+        speech_specs = [(seconds, "ءَلِف"[: 1 + i % 4]) for i in range(num_speech)]
     train = [
-        cut(f"audio/moshaf_6.0/{i}.flac", "ءَلِف"[: 1 + i % 4], f"moshaf_6.0__{i}", "speech")
-        for i in range(num_speech)
+        cut(f"audio/moshaf_6.0/{i}.flac", text, f"moshaf_6.0__{i}", "speech", secs)
+        for i, (secs, text) in enumerate(speech_specs)
     ]
     train.append(cut("audio/noise/000000.flac", "", "noise__000000", "silence"))
     noise_aug = [
@@ -229,3 +233,38 @@ def make_tiny_model(tiny_cfg_factory):
 @pytest.fixture
 def tiny_model(make_tiny_model):
     return make_tiny_model()
+
+
+@pytest.fixture(scope="session")
+def tiny_data_dir_infeasible(tmp_path_factory):
+    """10 speech cuts: 8 feasible one-second cuts and 2 cuts of 0.3 s with a
+    10-char repeated label (19 CTC frames needed, ~10 available at factor 1 /
+    speed 1.1), so 20% of the speech cuts fail the frame budget."""
+    specs = [(1, "ءَلِف"[: 1 + i % 4]) for i in range(8)] + [(0.3, "ۦ" * 10)] * 2
+    return _build_data_dir(
+        tmp_path_factory.mktemp("tiny_data_infeasible"), num_speech=10, seconds=1, speech_specs=specs
+    )
+
+
+@pytest.fixture
+def tiny_cfg(tiny_cfg_factory, tmp_path):
+    """Tiny-dims config for CPU training-loop tests (output under `tmp_path/out`)."""
+    return tiny_cfg_factory(
+        save_every_n_batches=3,
+        num_workers=2,
+        max_duration=4,
+        num_epochs=1,
+        log_every=1,
+        dev_max_cuts=8,
+        keep_last_k=3,
+        avg_last_k=1,
+        output_dir=str(tmp_path / "out"),
+    )
+
+
+@pytest.fixture
+def local_remote(tmp_path, monkeypatch):
+    """rclone `remote:path` backed by a local directory (no network)."""
+    monkeypatch.setenv("RCLONE_CONFIG_TESTLOCAL_TYPE", "local")
+    (tmp_path / "drive").mkdir()
+    return f"testlocal:{tmp_path / 'drive'}"
