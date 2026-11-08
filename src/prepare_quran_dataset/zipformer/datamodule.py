@@ -139,14 +139,17 @@ def _init_worker(worker_id: int, seed: int) -> None:
     lhotse_worker_init_fn(worker_id, seed=seed)
 
 
-def _loader(cfg: ZipformerTrainConfig, ds, sampler) -> DataLoader:
+def _loader(cfg: ZipformerTrainConfig, ds, sampler, seed: int) -> DataLoader:
+    """`seed` feeds the per-worker augmentation RNG (Lhotse adds `100 * worker_id`);
+    the loader is rebuilt every epoch, so callers vary it per epoch or the
+    CutMix/SpecAugment draws replay identically each epoch."""
     return DataLoader(
         ds,
         sampler=sampler,
         batch_size=None,
         num_workers=cfg.num_workers,
         persistent_workers=cfg.num_workers > 0,
-        worker_init_fn=functools.partial(_init_worker, seed=cfg.seed) if cfg.num_workers > 0 else None,
+        worker_init_fn=functools.partial(_init_worker, seed=seed) if cfg.num_workers > 0 else None,
     )
 
 
@@ -212,8 +215,12 @@ def train_dataloader(
     if sampler_state is not None:
         log.info("fast-forwarding sampler by %d batches…", batches_consumed)
         restore_sampler(sampler, sampler_state, batches_consumed)
+    # augmentation RNG differs per epoch; the sampler order (and so resume) does not depend on it
     return _loader(
-        cfg, _dataset(cfg, load_cuts(data_dir, "noise_aug"), train=True), sampler
+        cfg,
+        _dataset(cfg, load_cuts(data_dir, "noise_aug"), train=True),
+        sampler,
+        seed=cfg.seed + 1000 * epoch,
     )
 
 
@@ -223,7 +230,7 @@ def eval_dataloader(
     """Unshuffled loader over every cut of `cuts`, no augmentation."""
     max_duration = max_duration if max_duration is not None else cfg.max_duration
     sampler = _sampler(cuts, max_duration, shuffle=False, drop_last=False)
-    return _loader(cfg, _dataset(cfg, None, train=False), sampler)
+    return _loader(cfg, _dataset(cfg, None, train=False), sampler, seed=cfg.seed)
 
 
 def batch_to_tensors(batch: dict) -> tuple[Tensor, Tensor, list[str], list[MonoCut]]:

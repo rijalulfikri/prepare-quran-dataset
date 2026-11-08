@@ -694,7 +694,7 @@ def run_steps_for_test(cfg: ZipformerTrainConfig, data_dir: Path, tokens: Phonem
 
 def main(argv: list[str] | None = None) -> int:
     load_dotenv()  # WANDB_API_KEY (see .env.example)
-    parser =argparse.ArgumentParser(prog="python -m prepare_quran_dataset.zipformer.train_loop")
+    parser = argparse.ArgumentParser(prog="python -m prepare_quran_dataset.zipformer.train_loop")
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--data-dir", type=Path, default=None, help="default: config data_dir")
     parser.add_argument("--vocab", type=Path, default=DEFAULT_VOCAB)

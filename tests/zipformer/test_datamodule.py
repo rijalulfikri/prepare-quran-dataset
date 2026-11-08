@@ -137,6 +137,16 @@ def test_cutmix_seed_is_randomized_per_worker(tiny_data_dir, cfg):
     assert {type(c).__name__ for c in cuts} == {"MixedCut"}
 
 
+def test_worker_augmentation_seed_changes_per_epoch(tiny_data_dir, cfg):
+    # the loader is rebuilt every epoch; a constant worker seed would replay the
+    # same CutMix / SpecAugment draws each epoch
+    cfg.num_workers = 1
+    seeds = [dm.train_dataloader(cfg, tiny_data_dir, epoch=e).worker_init_fn.keywords["seed"] for e in (0, 1)]
+    assert seeds[0] != seeds[1]
+    eval_seed = dm.eval_dataloader(cfg, dm.load_cuts(tiny_data_dir, "dev")).worker_init_fn.keywords["seed"]
+    assert eval_seed == cfg.seed
+
+
 def test_restore_sampler_rejects_unknown_state_layout(tiny_data_dir_big, cfg):
     cfg.num_workers = 0
     cfg.max_duration = 4

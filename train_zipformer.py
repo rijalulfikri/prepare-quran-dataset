@@ -20,7 +20,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-log =logging.getLogger("train_zipformer")
+log = logging.getLogger("train_zipformer")
 
 DEFAULT_CONFIG = "configs/train/zipformer/train_config.yml"
 STAGES = ["prepare", "train", "eval", "export"]
