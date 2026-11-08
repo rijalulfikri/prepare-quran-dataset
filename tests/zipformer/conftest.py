@@ -126,3 +126,58 @@ def make_cut_in_memory():
         )
 
     return _make
+
+
+def _build_data_dir(root, num_speech, seconds):
+    """Data dir in Task 4's layout: `seconds`-long FLACs under `root/audio/...` and
+    `cuts_{train,dev,noise_aug}.jsonl.gz` manifests with relative paths."""
+    import io
+
+    import numpy as np
+    import soundfile as sf
+
+    from prepare_quran_dataset.zipformer.data_prep import _write_cuts, make_cut, write_flac
+
+    rng = np.random.default_rng(0)
+
+    def flac(rel):
+        # low-amplitude sine + noise (not silence) so fbank is well-defined
+        n = seconds * 16000
+        t = np.arange(n) / 16000
+        wav = 0.1 * np.sin(2 * np.pi * rng.uniform(100, 400) * t)
+        wav += 0.01 * rng.standard_normal(n)
+        buf = io.BytesIO()
+        sf.write(buf, wav.astype("float32"), 16000, format="WAV")
+        return write_flac(buf.getvalue(), root / rel)
+
+    def cut(rel, text, cut_id, input_type):
+        return make_cut(rel, flac(rel), text, cut_id, {"input_type": input_type}, root)
+
+    train = [
+        cut(f"audio/moshaf_6.0/{i}.flac", "ءَلِف"[: 1 + i % 4], f"moshaf_6.0__{i}", "speech")
+        for i in range(num_speech)
+    ]
+    train.append(cut("audio/noise/000000.flac", "", "noise__000000", "silence"))
+    noise_aug = [
+        cut(f"audio/noise/{i:06d}.flac", "", f"noise__{i:06d}", "silence") for i in (1, 2)
+    ]
+    _write_cuts(train, root / "cuts_train.jsonl.gz")
+    _write_cuts(train, root / "cuts_dev.jsonl.gz")
+    _write_cuts(noise_aug, root / "cuts_noise_aug.jsonl.gz")
+    return root
+
+
+@pytest.fixture(scope="session")
+def tiny_data_dir(tmp_path_factory):
+    """3 speech + 1 silence three-second cuts (train == dev) and 2 noise_aug cuts.
+
+    Three seconds, not one: with `drop_last=True` and Lhotse's minimum of 2
+    buckets, x3 speed-perturbed one-second cuts (~12 s) cannot fill a full
+    batch at `max_duration=10`, so the loader would yield nothing."""
+    return _build_data_dir(tmp_path_factory.mktemp("tiny_data"), num_speech=3, seconds=3)
+
+
+@pytest.fixture(scope="session")
+def tiny_data_dir_big(tmp_path_factory):
+    """Same layout with 60 one-second cuts, so an epoch at `max_duration=4` has >= 10 batches."""
+    return _build_data_dir(tmp_path_factory.mktemp("tiny_data_big"), num_speech=59, seconds=1)
