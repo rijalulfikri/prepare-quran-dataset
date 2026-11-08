@@ -22,12 +22,14 @@ import os
 import signal
 import sys
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
 
 import torch
+from dotenv import load_dotenv
 from lhotse import CutSet
 from torch import Tensor
 
@@ -259,8 +261,17 @@ def resolve_resume(cfg: ZipformerTrainConfig, backup: DriveBackup | None) -> Pat
         log.info("resume: source=none checkpoint=- epoch=1 batch_idx_train=0")
         return None
     pt, meta = chosen
-    log.info("resume: source=%s checkpoint=%s epoch=%d batch_idx_train=%d", source, pt.name, meta.epoch, meta.batch_idx_train)
+    log.info(
+        "resume: source=%s checkpoint=%s epoch=%d batch_idx_train=%d age=%s",
+        source, pt.name, meta.epoch, meta.batch_idx_train, _age(pt),
+    )
     return pt
+
+
+def _age(pt: Path) -> str:
+    """`Xh Ym` since `pt`'s mtime (rclone copyto keeps the remote modtime)."""
+    minutes = max(int(time.time() - pt.stat().st_mtime), 0) // 60
+    return f"{minutes // 60}h {minutes % 60}m"
 
 
 # ------------------------------------------------------------------ frame budget
@@ -682,7 +693,8 @@ def run_steps_for_test(cfg: ZipformerTrainConfig, data_dir: Path, tokens: Phonem
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="python -m prepare_quran_dataset.zipformer.train_loop")
+    load_dotenv()  # WANDB_API_KEY (see .env.example)
+    parser =argparse.ArgumentParser(prog="python -m prepare_quran_dataset.zipformer.train_loop")
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--data-dir", type=Path, default=None, help="default: config data_dir")
     parser.add_argument("--vocab", type=Path, default=DEFAULT_VOCAB)

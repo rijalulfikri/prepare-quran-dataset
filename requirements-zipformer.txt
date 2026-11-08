@@ -1,12 +1,15 @@
 # verified pair: torch==2.9.1 + k2==<wheel version> (cp314, cuda 12.x)  <- fill in
 torch==2.9.1
 torchaudio==2.9.1
-lhotse>=1.30
+lhotse==1.33.0  # datamodule.restore_sampler rewrites this version's sampler state layout
 onnx
 onnxruntime
-onnxsim
-kaldifeat ; platform_system == "Linux"
 sentencepiece
+# module-level imports of icefall/icefall/utils.py (icefall is used from the
+# external/icefall submodule via sys.path, never pip-installed)
+kaldialign
+pypinyin
+packaging
 tensorboard
 wandb
 python-dotenv

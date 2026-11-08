@@ -18,7 +18,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-log = logging.getLogger("train_zipformer")
+from dotenv import load_dotenv
+
+log =logging.getLogger("train_zipformer")
 
 DEFAULT_CONFIG = "configs/train/zipformer/train_config.yml"
 STAGES = ["prepare", "train", "eval", "export"]
@@ -101,7 +103,16 @@ def check_rclone() -> None:
 def stage_prepare(cfg, args: argparse.Namespace) -> None:
     check_rclone()
     log.info("syncing %s -> %s", cfg.rclone_remote_path, cfg.data_dir)
-    subprocess.run(["rclone", "sync", cfg.rclone_remote_path, str(cfg.data_dir), "--progress"], check=True)
+    # ~250-300 k small FLAC files and a request-rate-limited Drive API: many
+    # parallel transfers/checkers, one recursive listing, a faster pacer
+    subprocess.run(
+        [
+            "rclone", "sync", cfg.rclone_remote_path, str(cfg.data_dir), "--progress",
+            "--transfers", "32", "--checkers", "32", "--fast-list",
+            "--drive-pacer-min-sleep", "10ms", "--drive-pacer-burst", "200",
+        ],
+        check=True,
+    )
 
 
 def stage_train(cfg, args: argparse.Namespace) -> Path:
@@ -187,10 +198,8 @@ def stage_export(cfg, args: argparse.Namespace) -> dict:
 def push_to_hub(cfg) -> None:
     import os
 
-    from dotenv import load_dotenv
     from huggingface_hub import HfApi
 
-    load_dotenv()
     output_dir = Path(cfg.output_dir)
     repo = cfg.hub_model_id
     api = HfApi(token=os.environ.get("HUGGINGFACE_TOKEN") or None)
@@ -214,6 +223,7 @@ def push_to_hub(cfg) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_dotenv()  # WANDB_API_KEY, HUGGINGFACE_TOKEN (see .env.example)
     args = parse_args(argv)
     logging.basicConfig(
         level=logging.INFO, stream=sys.stderr, format="%(asctime)s %(levelname)s %(name)s: %(message)s"

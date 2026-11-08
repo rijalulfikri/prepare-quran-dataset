@@ -156,3 +156,25 @@ def test_resolve_resume_nothing(tmp_path, tiny_cfg, caplog):
     with caplog.at_level(logging.INFO, logger=tl.__name__):
         assert tl.resolve_resume(tiny_cfg, None) is None
     assert "resume: source=none checkpoint=- epoch=1 batch_idx_train=0" in caplog.text
+
+
+def test_resume_line_shows_checkpoint_age(tmp_path, tiny_cfg, caplog):
+    import os
+    import time
+
+    import torch
+
+    out = tmp_path / "out"
+    out.mkdir(exist_ok=True)
+    tiny_cfg.output_dir = str(out)
+    pt = out / ck.ckpt_name("batch", 6, 1)
+    ck.save_checkpoint_atomic(
+        {"x": torch.zeros(3)},
+        pt,
+        {"kind": "batch", "batch_idx_train": 6, "epoch": 1, "batches_consumed_in_epoch": 6},
+    )
+    then = time.time() - (2 * 3600 + 5 * 60 + 30)
+    os.utime(pt, (then, then))
+    with caplog.at_level(logging.INFO, logger=tl.__name__):
+        assert tl.resolve_resume(tiny_cfg, None) == pt
+    assert "resume: source=local checkpoint=checkpoint-6.pt epoch=1 batch_idx_train=6 age=2h 5m" in caplog.text

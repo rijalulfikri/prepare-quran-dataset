@@ -82,3 +82,41 @@ def test_parity_wavs_skips_silence_and_unsupervised_cuts(monkeypatch, caplog):
     wavs = _parity_wavs_over(monkeypatch, [_Cut([]), _Cut([_Sup("silence")]), _Cut([_Sup("speech")])])
     assert len(wavs) == 1
     assert "only 1 test speech cuts" in caplog.text
+
+
+def test_prepare_syncs_with_drive_tuned_flags(monkeypatch):
+    monkeypatch.setattr(tz, "check_rclone", lambda: None)
+    calls = []
+    monkeypatch.setattr(tz.subprocess, "run", lambda cmd, **kwargs: calls.append(cmd))
+    cfg = types.SimpleNamespace(rclone_remote_path="gdrive:data", data_dir="data-zipformer")
+    tz.stage_prepare(cfg, tz.parse_args([]))
+    assert calls == [
+        [
+            "rclone", "sync", "gdrive:data", "data-zipformer", "--progress",
+            "--transfers", "32", "--checkers", "32", "--fast-list",
+            "--drive-pacer-min-sleep", "10ms", "--drive-pacer-burst", "200",
+        ]
+    ]
+
+
+class _DotenvLoaded(Exception):
+    pass
+
+
+def _raise_loaded(*args, **kwargs):
+    raise _DotenvLoaded
+
+
+def test_main_loads_dotenv_first(monkeypatch):
+    monkeypatch.setattr(tz, "load_dotenv", _raise_loaded)
+    with pytest.raises(_DotenvLoaded):
+        tz.main(["--stage", "train", "--config", "does-not-exist.yml"])
+
+
+def test_train_loop_main_loads_dotenv_first(monkeypatch):
+    pytest.importorskip("k2")
+    from prepare_quran_dataset.zipformer import train_loop as tl
+
+    monkeypatch.setattr(tl, "load_dotenv", _raise_loaded)
+    with pytest.raises(_DotenvLoaded):
+        tl.main(["--config", "does-not-exist.yml"])

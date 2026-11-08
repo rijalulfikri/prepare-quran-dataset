@@ -514,6 +514,8 @@ rclone lsd gdrive:          # harus menampilkan folder muaalem-zipformer-data
 
 File konfigurasinya ada di `~/.config/rclone/rclone.conf` (cek dengan `rclone config file`). Jika box tidak punya browser dan Anda mengonfigurasi langsung di box, jawab `n` pada "Use web browser to automatically authenticate" lalu jalankan `rclone authorize "drive"` di komputer lokal.
 
+`train_zipformer.sh` menerima salah satu dari tiga sumber konfigurasi rclone: file `~/.config/rclone/rclone.conf`, file yang ditunjuk `RCLONE_CONFIG=/path/ke/rclone.conf`, atau remote yang didefinisikan lewat environment (`RCLONE_CONFIG_<REMOTE>_TYPE=drive` beserta `RCLONE_CONFIG_<REMOTE>_TOKEN` dst., mis. `RCLONE_CONFIG_GDRIVE_TYPE=drive`).
+
 Field terkait di config:
 
 | Field | Default | Keterangan |
@@ -521,6 +523,8 @@ Field terkait di config:
 | `rclone_remote_path` | `gdrive:muaalem-zipformer-data` | sumber data untuk `--stage prepare` (`rclone sync` ke `data_dir`) |
 | `data_dir` | `./data-zipformer` | lokasi data lokal di box |
 | `rclone_checkpoint_path` | `gdrive:muaalem-zipformer-data/checkpoints/muaalem-zipformer-ctc-v0` | backup checkpoint ke Drive; `null` menonaktifkan backup |
+
+**Waktu sinkronisasi data.** Dataset berisi ~250–300 ribu file FLAC kecil, dan Google Drive membatasi jumlah request per detik, sehingga `rclone sync` pertama bisa memakan waktu berjam-jam, bukan 30–60 menit. Ukur waktu sync untuk satu moshaf saat smoke run (Task 12) sebelum memutuskan layout data ini; perkiraan waktu "setup" di bagian [Jika box Vast.ai mati di tengah training](#jika-box-vastai-mati-di-tengah-training) bergantung pada hasil pengukuran tersebut.
 
 ### 3. Jalankan di Vast.ai
 
@@ -537,8 +541,8 @@ bash train_zipformer.sh
 
 `train_zipformer.sh` melakukan, dan semua langkahnya idempotent:
 
-1. Membuat `.venv-zipformer` (Python 3.14; fallback 3.12 dengan `PYTHONPATH=src` jika wheel k2 untuk cp314 tidak ada), menginstall torch 2.9.1, k2 (`K2_WHEEL_URL`, pilih wheel di https://k2-fsa.github.io/k2/cuda.html), `requirements-zipformer.txt`, `pip install -e .` (hanya di Python 3.14; fallback 3.12 memakai `PYTHONPATH=src` karena `pyproject.toml` mensyaratkan Python >=3.14), cek import modul training/qdat_bench (gagal dalam hitungan menit jika ada dependency yang kurang), dan submodule `external/icefall`.
-2. Menginstall rclone jika belum ada, menolak jalan tanpa `rclone.conf` (`~/.config/rclone/rclone.conf` atau `RCLONE_CONFIG`), cek koneksi (`rclone lsd`), dan menampilkan isi folder checkpoint Drive (`rclone lsl <rclone_checkpoint_path>`) supaya terlihat apa yang akan di-resume.
+1. Berhenti sebelum membuat venv atau menginstall torch jika `K2_WHEEL_URL` dan `K2_WHEEL_URL_CP312` masih placeholder. Membuat `.venv-zipformer` (Python 3.14; fallback 3.12 dengan `PYTHONPATH=src` jika wheel k2 untuk cp314 tidak ada), menginstall torch 2.9.1, k2 (`K2_WHEEL_URL`, pilih wheel di https://k2-fsa.github.io/k2/cuda.html), `requirements-zipformer.txt`, `pip install -e .` (hanya di Python 3.14; fallback 3.12 memakai `PYTHONPATH=src` karena `pyproject.toml` mensyaratkan Python >=3.14), cek import modul training/qdat_bench (gagal dalam hitungan menit jika ada dependency yang kurang), dan submodule `external/icefall`.
+2. Menginstall rclone jika belum ada, menolak jalan tanpa konfigurasi rclone (`~/.config/rclone/rclone.conf`, `RCLONE_CONFIG`, atau `RCLONE_CONFIG_<REMOTE>_TYPE` di environment), cek koneksi (`rclone lsd`), dan menampilkan isi folder checkpoint Drive (`rclone lsl <rclone_checkpoint_path>`) supaya terlihat apa yang akan di-resume.
 3. `python train_zipformer.py --config configs/train/zipformer/train_config.yml --stage all "$@"`. Dengan `AUTO_RESTART=1`, crash dengan exit code selain 0/143 diulang maksimal 3 kali dengan jeda 60 detik (untuk error CUDA/NCCL/data-loader sementara; tidak menolong jika box-nya mati).
 4. Menampilkan path hasil export dan contoh perintah `scp`.
 
@@ -557,10 +561,10 @@ Argumen tambahan diteruskan ke `train_zipformer.py`, mis. `bash train_zipformer.
 
 Stage:
 
-* `prepare`: `rclone sync <rclone_remote_path> <data_dir> --progress`. Gagal dengan pesan jelas jika `rclone` tidak ada atau belum ada remote (`rclone listremotes` kosong).
+* `prepare`: `rclone sync <rclone_remote_path> <data_dir> --progress --transfers 32 --checkers 32 --fast-list --drive-pacer-min-sleep 10ms --drive-pacer-burst 200`. Gagal dengan pesan jelas jika `rclone` tidak ada atau belum ada remote (`rclone listremotes` kosong).
 * `train`: training dengan resume otomatis dari checkpoint lokal atau Drive (mana yang lebih baru), lalu merata-ratakan `avg_last_k` epoch terakhir menjadi `averaged-<k>.pt`. Jika `rclone lsjson` ke Drive gagal, muncul warning dan training lanjut dengan checkpoint lokal saja.
 * `eval`: PER test set (`per_phonemes`) dengan `export_chunk_size` / `export_left_context` → `test_results.json` (dilewati jika sudah ada, kecuali `--rerun-testset`).
-* `export`: ONNX streaming fp32 + int8 ke `export/`, cek bahwa decode ONNX sama persis dengan PyTorch pada 5 cut test, lalu qdat_bench dengan model ONNX fp32.
+* `export`: ONNX streaming fp32 + int8 ke `export/`, cek bahwa decode ONNX cocok dengan PyTorch pada 5 cut test (kesesuaian argmax per frame ≥ 99 % dan PER token ONNX vs PyTorch ≤ 1 %; keduanya dicatat di log), lalu qdat_bench dengan model ONNX fp32.
 
 Exit code: `0` sukses, `143` berhenti dengan aman (mis. SIGTERM; checkpoint sudah di-flush), `1` gagal.
 
@@ -596,12 +600,12 @@ bash train_zipformer.sh
 Perintah ini sekaligus perintah restart: data disinkronkan ulang dari Drive, checkpoint terbaru diunduh dari `rclone_checkpoint_path`, dan training lanjut dari batch tersebut. Sebelum training, log menampilkan satu baris seperti:
 
 ```
-resume: source=drive checkpoint=checkpoint-48000.pt epoch=5 batch_idx_train=48000
+resume: source=drive checkpoint=checkpoint-48000.pt epoch=5 batch_idx_train=48000 age=0h 23m
 ```
 
-`source=drive` berarti checkpoint diambil dari Drive (normal di box baru), `source=local` berarti checkpoint lokal dipakai, `source=none checkpoint=- epoch=1 batch_idx_train=0` berarti training mulai dari awal. Jika di box baru muncul `source=none` padahal Drive berisi checkpoint, hentikan dan periksa `rclone_checkpoint_path` / `rclone.conf`.
+`age` adalah umur checkpoint yang dipakai (dari waktu modifikasi file `.pt`; `rclone copyto` mempertahankan waktu modifikasi dari Drive). `source=drive` berarti checkpoint diambil dari Drive (normal di box baru), `source=local` berarti checkpoint lokal dipakai, `source=none checkpoint=- epoch=1 batch_idx_train=0` berarti training mulai dari awal. Jika di box baru muncul `source=none` padahal Drive berisi checkpoint, hentikan dan periksa `rclone_checkpoint_path` / `rclone.conf`.
 
-Perkiraan kerugian: progres maksimal satu interval `save_every_n_batches` (~25 menit di 4090) ditambah waktu setup ~30–60 menit (install environment + sinkronisasi data ~60 GB).
+Perkiraan kerugian: progres maksimal satu interval `save_every_n_batches` (~25 menit di 4090) ditambah waktu setup ~30–60 menit (install environment + sinkronisasi data ~60 GB). Angka setup ini belum terukur: sinkronisasi ~250–300 ribu file kecil dari Drive bisa berjam-jam (lihat "Waktu sinkronisasi data" di atas).
 
 **Jika box interruptible yang sama hidup lagi**, cukup jalankan ulang perintah yang sama: checkpoint lokal dipakai, kecuali Drive punya checkpoint yang lebih baru.
 

@@ -38,6 +38,14 @@ K2_PLACEHOLDER="FILL_IN_FROM_https://k2-fsa.github.io/k2/cuda.html"
 K2_WHEEL_URL="${K2_WHEEL_URL:-$K2_PLACEHOLDER}"
 K2_WHEEL_URL_CP312="${K2_WHEEL_URL_CP312:-$K2_PLACEHOLDER}"
 
+# Gagal cepat, sebelum membuat venv atau menginstall torch (beberapa GB).
+if [[ "$K2_WHEEL_URL" == "$K2_PLACEHOLDER" && "$K2_WHEEL_URL_CP312" == "$K2_PLACEHOLDER" ]]; then
+    echo "ERROR: K2_WHEEL_URL dan K2_WHEEL_URL_CP312 belum diisi."
+    echo "Pilih wheel k2 untuk torch 2.9.1 + CUDA 12.x di https://k2-fsa.github.io/k2/cuda.html, lalu mis.:"
+    echo "  K2_WHEEL_URL=<url wheel cp314> K2_WHEEL_URL_CP312=<url wheel cp312> bash train_zipformer.sh"
+    exit 1
+fi
+
 echo "============================================================"
 echo "  MUAALEM ZIPFORMER2-CTC: PIPELINE TRAINING & EXPORT ONNX"
 echo "============================================================"
@@ -121,12 +129,21 @@ if ! command -v rclone &> /dev/null; then
     curl https://rclone.org/install.sh | bash
 fi
 
+# Diterima: file RCLONE_CONFIG, ~/.config/rclone/rclone.conf, atau remote yang
+# didefinisikan lewat environment (RCLONE_CONFIG_<REMOTE>_TYPE=drive, dst.).
 RCLONE_CONF_FILE="${RCLONE_CONFIG:-$HOME/.config/rclone/rclone.conf}"
-if [ ! -f "$RCLONE_CONF_FILE" ]; then
-    echo "ERROR: rclone.conf tidak ditemukan di $RCLONE_CONF_FILE"
-    echo "Salin dari komputer lokal, mis.:"
-    echo "  scp -P <PORT> ~/.config/rclone/rclone.conf root@<IP_VAST_AI>:~/.config/rclone/rclone.conf"
-    echo "atau set RCLONE_CONFIG=/path/ke/rclone.conf"
+if [ -f "$RCLONE_CONF_FILE" ]; then
+    echo "rclone config: $RCLONE_CONF_FILE"
+elif grep -q '^RCLONE_CONFIG_.*_TYPE=' < <(env); then
+    echo "rclone config: remote dari environment (RCLONE_CONFIG_<REMOTE>_TYPE)"
+else
+    echo "ERROR: konfigurasi rclone tidak ditemukan ($RCLONE_CONF_FILE tidak ada dan tidak ada RCLONE_CONFIG_<REMOTE>_TYPE)."
+    echo "Pilih salah satu:"
+    echo "  - salin rclone.conf dari komputer lokal, mis.:"
+    echo "      scp -P <PORT> ~/.config/rclone/rclone.conf root@<IP_VAST_AI>:~/.config/rclone/rclone.conf"
+    echo "  - set RCLONE_CONFIG=/path/ke/rclone.conf"
+    echo "  - definisikan remote lewat environment, mis. RCLONE_CONFIG_GDRIVE_TYPE=drive"
+    echo "      RCLONE_CONFIG_GDRIVE_SCOPE=drive RCLONE_CONFIG_GDRIVE_TOKEN='<json token>'"
     exit 1
 fi
 if [ ! -f ".env" ]; then
