@@ -134,6 +134,17 @@ def test_prune_remote_keeps_newer_meta_less_pt(tmp_path, remote):
     assert names == ["checkpoint-2000.meta.json", "checkpoint-2000.pt", "checkpoint-4000.pt"]
 
 
+def test_remote_complete_metas_newest_first(tmp_path, remote):
+    src = tmp_path / "src"
+    src.mkdir()
+    bk = DriveBackup(remote, keep_last_k=5, timeout=60)
+    for kind, b, e in (("batch", 2000, 1), ("epoch", 3000, 1), ("batch", 4000, 2)):
+        _save(src, kind, b, e)
+        bk.submit(src / ck.ckpt_name(kind, b, e))
+    assert bk.flush(60)
+    assert [m.name for m in bk.remote_complete_metas()] == ["checkpoint-4000.pt", "epoch-1.pt", "checkpoint-2000.pt"]
+
+
 def test_latest_remote_empty(tmp_path, remote):
     assert DriveBackup(remote, keep_last_k=3, timeout=60).latest_remote() is None
 

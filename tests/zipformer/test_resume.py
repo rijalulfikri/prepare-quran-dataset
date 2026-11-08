@@ -109,6 +109,49 @@ def test_remote_listing_failure_falls_back_to_local(tmp_path, tiny_cfg, tiny_dat
     assert "resume: source=local" in caplog.text
 
 
+def _drive_with_3_and_6(tmp_path, tiny_cfg, tiny_data_dir_big, tokens, remote):
+    """boxA trained to 6; Drive holds complete batch-3 and batch-6 checkpoints."""
+    tiny_cfg.output_dir = str(tmp_path / "boxA")
+    tiny_cfg.rclone_checkpoint_path = remote
+    tl.run_steps_for_test(tiny_cfg, tiny_data_dir_big, tokens, n_batches=3)  # 3 uploaded and flushed
+    tl.run_steps_for_test(tiny_cfg, tiny_data_dir_big, tokens, n_batches=3)  # then 6
+    drive = tmp_path / "drive"
+    assert {"checkpoint-3.pt", "checkpoint-6.pt"} <= {p.name for p in drive.iterdir()}
+    pt6 = drive / "checkpoint-6.pt"
+    data = bytearray(pt6.read_bytes())
+    data[-1] ^= 0xFF  # same size, so it still lists as complete; sha256 fails on download
+    pt6.write_bytes(bytes(data))
+    return drive
+
+
+@needs_rclone
+def test_corrupt_newer_drive_checkpoint_without_fallback_raises(tmp_path, tiny_cfg, tiny_data_dir_big, tokens, local_remote):
+    drive = _drive_with_3_and_6(tmp_path, tiny_cfg, tiny_data_dir_big, tokens, local_remote)
+    for name in ("checkpoint-3.pt", "checkpoint-3.meta.json"):
+        (drive / name).unlink()  # no older remote candidate
+    box = tmp_path / "boxA"
+    for name in ("checkpoint-6.pt", "checkpoint-6.meta.json"):
+        (box / name).unlink()  # local is at 3, Drive (corrupt) claims 6
+    backup = tl.make_backup(tiny_cfg)
+    downloads = []
+    real_download = backup.download
+    backup.download = lambda meta, d: downloads.append(meta.name) or real_download(meta, d)
+    with pytest.raises(tl.ResumeError):
+        tl.resolve_resume(tiny_cfg, backup)
+    assert downloads == ["checkpoint-6.pt", "checkpoint-6.pt"]  # retried once
+    assert ck.latest_complete(box)[0].name == "checkpoint-3.pt"  # local untouched, nothing corrupt left
+
+
+@needs_rclone
+def test_corrupt_newest_drive_checkpoint_falls_back_to_older_remote(tmp_path, tiny_cfg, tiny_data_dir_big, tokens, local_remote):
+    _drive_with_3_and_6(tmp_path, tiny_cfg, tiny_data_dir_big, tokens, local_remote)
+    tiny_cfg.output_dir = str(tmp_path / "boxB")  # new box: Drive's batch-3 is newer than nothing
+    pt = tl.resolve_resume(tiny_cfg, tl.make_backup(tiny_cfg))
+    assert pt == tmp_path / "boxB" / "checkpoint-3.pt"
+    assert ck.verify_sha256(pt, ck.read_meta(pt))
+    assert not (tmp_path / "boxB" / "checkpoint-6.pt").exists()
+
+
 def test_resolve_resume_nothing(tmp_path, tiny_cfg, caplog):
     with caplog.at_level(logging.INFO, logger=tl.__name__):
         assert tl.resolve_resume(tiny_cfg, None) is None

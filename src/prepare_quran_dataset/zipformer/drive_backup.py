@@ -203,6 +203,10 @@ class DriveBackup:
         metas.sort(key=ck.CkptMeta.sort_key)
         return metas
 
+    def remote_complete_metas(self) -> list[ck.CkptMeta]:
+        """All complete remote checkpoints, newest first."""
+        return self._remote_metas()[::-1]
+
     def latest_remote(self) -> ck.CkptMeta | None:
         metas = self._remote_metas()
         return metas[-1] if metas else None

@@ -1,7 +1,11 @@
 import json
 import os
+import re
 import signal
+import subprocess
+import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -226,3 +230,120 @@ def test_run_training_end_to_end_then_skip_when_complete(tiny_cfg, tiny_data_dir
     assert tl.run_training(tiny_cfg, tiny_data_dir, tokens, CPU) == avg and avg.exists()
     lines = [json.loads(x) for x in (out / "dev_metrics.jsonl").read_text().splitlines()]
     assert [x["epoch"] for x in lines] == [1]
+
+
+# ---------------------------------------------------------------- review fix round 1
+
+
+def _inf_loss(model, feats, feat_lens, targets, target_lengths):
+    return torch.tensor(float("inf")), feat_lens.sum()
+
+
+def _run_epoch(tiny_cfg, data_dir, tokens, model, max_batches=None):
+    opt, sched = tl.build_optimizer(model, tiny_cfg)
+    loader = train_dataloader(tiny_cfg, data_dir, epoch=1)
+    st = tl.TrainState()
+    try:
+        tl._train_batches(model, opt, sched, loader, st, tiny_cfg, tokens, CPU, tl.NullLogger(), None, None,
+                          max_batches=max_batches)
+    finally:
+        del loader
+    return st
+
+
+def test_divergence_raises_before_saving(tiny_cfg, tiny_data_dir_big, tokens, tiny_model, monkeypatch):
+    tiny_cfg.save_every_n_batches = tl.MAX_NONFINITE_BATCHES  # a save is due at the 20th bad batch
+    monkeypatch.setattr(tl, "compute_ctc_loss", _inf_loss)
+    with pytest.raises(tl.DivergedTraining, match="20 consecutive"):
+        _run_epoch(tiny_cfg, tiny_data_dir_big, tokens, tiny_model)
+    assert ck.latest_complete(tiny_cfg.output_dir) is None
+
+
+def test_nonfinite_streak_resets_on_finite_loss(tiny_cfg, tiny_data_dir_big, tokens, tiny_model, monkeypatch):
+    tiny_cfg.save_every_n_batches = 1000
+    real = tl.compute_ctc_loss
+    calls = []
+
+    def flaky(*args):
+        calls.append(1)
+        return real(*args) if len(calls) == 15 else _inf_loss(*args)  # 14 bad, 1 good, then bad
+
+    monkeypatch.setattr(tl, "compute_ctc_loss", flaky)
+    st = _run_epoch(tiny_cfg, tiny_data_dir_big, tokens, tiny_model, max_batches=30)
+    assert st.batch_idx_train == 30 and st.nonfinite_streak == 15
+
+
+def test_nan_weights_are_never_checkpointed(tiny_cfg, tiny_data_dir_big, tokens, tiny_model):
+    tiny_cfg.save_every_n_batches = 1
+    with torch.no_grad():
+        next(tiny_model.parameters()).fill_(float("nan"))
+    with pytest.raises(tl.DivergedTraining, match="non-finite weights"):
+        _run_epoch(tiny_cfg, tiny_data_dir_big, tokens, tiny_model, max_batches=2)
+    assert ck.latest_complete(tiny_cfg.output_dir) is None
+
+
+def test_torn_dev_metrics_line_is_skipped(tiny_cfg, tiny_data_dir, tokens, caplog):
+    out = Path(tiny_cfg.output_dir)
+    out.mkdir(parents=True)
+    (out / "dev_metrics.jsonl").write_text('{"epoch": 1, "per_phonemes": 0.5}\n{"epoch": 2, "per_ph')  # crash mid-write
+    with caplog.at_level("WARNING"):
+        assert tl._evaluated_epochs(out) == {1}
+    assert any("unparsable" in r.getMessage() for r in caplog.records)
+    tl.run_training(tiny_cfg, tiny_data_dir, tokens, CPU)  # start path must not choke on it
+    lines = (out / "dev_metrics.jsonl").read_text().splitlines()
+    assert len(lines) == 3 and json.loads(lines[-1])["epoch"] == 1  # new row not glued onto the torn one
+    assert tl._evaluated_epochs(out) == {1}
+
+
+def test_stop_during_dev_eval_flushes_and_stops(tiny_cfg, tiny_data_dir, tokens, monkeypatch):
+    tiny_cfg.num_epochs = 2
+    flags, flushed = [], []
+    monkeypatch.setattr(tl, "install_signal_handlers", flags.append)
+    real_dev_eval = tl._dev_eval
+
+    def dev_eval_then_sigterm(*args, **kwargs):
+        row = real_dev_eval(*args, **kwargs)
+        flags[0].set()  # SIGTERM arrives while the epoch is being evaluated
+        return row
+
+    monkeypatch.setattr(tl, "_dev_eval", dev_eval_then_sigterm)
+    backup = _FakeBackup(pending=())
+    backup.flush = lambda timeout: flushed.append(timeout) or True
+    monkeypatch.setattr(tl, "make_backup", lambda cfg: backup)
+    with pytest.raises(tl.TrainingInterrupted):
+        tl.run_training(tiny_cfg, tiny_data_dir, tokens, CPU)
+    path, meta = ck.latest_complete(tiny_cfg.output_dir)
+    assert path.name == "epoch-1.pt" and meta.kind == "epoch"
+    assert backup.submitted[-1] == path
+    assert flushed == [tiny_cfg.shutdown_flush_seconds]
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT], ids=["SIGTERM", "SIGINT"])
+def test_signal_to_process_group_stops_gracefully(tmp_path, tiny_cfg, tiny_data_dir_big, sig):
+    # preemption (SIGTERM) / Ctrl-C (SIGINT) signal the whole process group, DataLoader workers
+    # included; a worker killed by SIGTERM makes torch's SIGCHLD handler crash the main loop
+    tiny_cfg.num_epochs = 50
+    tiny_cfg.save_every_n_batches = 2
+    tiny_cfg.to_yaml(tmp_path / "cfg.yml")
+    out = Path(tiny_cfg.output_dir)
+    env = {k: v for k, v in os.environ.items() if k != "WANDB_API_KEY"}
+    cmd = [sys.executable, "-m", "prepare_quran_dataset.zipformer.train_loop", "--config", str(tmp_path / "cfg.yml"),
+           "--data-dir", str(tiny_data_dir_big), "--device", "cpu"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            start_new_session=True, env=env)
+    try:
+        deadline = time.monotonic() + 90
+        while ck.read_meta(out / "checkpoint-2.pt") is None:  # workers up, batches flowing
+            assert proc.poll() is None and time.monotonic() < deadline, "training did not reach batch 2"
+            time.sleep(0.1)
+        os.killpg(proc.pid, sig)
+        _, stderr = proc.communicate(timeout=90)
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+    assert "exited unexpectedly" not in stderr
+    assert proc.returncode == 130, stderr[-3000:]
+    stopped_at = int(re.search(r"stopped at batch_idx_train=(\d+)", stderr).group(1))
+    path, meta = ck.latest_complete(out)
+    assert path.name == f"checkpoint-{stopped_at}.pt" and meta.batch_idx_train == stopped_at >= 2

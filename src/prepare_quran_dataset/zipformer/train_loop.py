@@ -71,6 +71,17 @@ class TrainingInterrupted(RuntimeError):
     pass
 
 
+class ResumeError(RuntimeError):
+    """Drive holds a newer checkpoint that cannot be fetched; resuming older would lose work."""
+
+
+class DivergedTraining(RuntimeError):
+    """Weights or losses went non-finite; stop before checkpointing the damage."""
+
+
+MAX_NONFINITE_BATCHES = 20  # consecutive non-finite losses tolerated
+
+
 @dataclass
 class TrainState:
     epoch: int = 1
@@ -78,6 +89,7 @@ class TrainState:
     batches_consumed_in_epoch: int = 0  # batches the loop finished in `epoch`
     sampler_state: dict | None = None  # `loader.sampler.state_dict()` at the last save
     wandb_run_id: str | None = None
+    nonfinite_streak: int = 0  # consecutive non-finite losses (not checkpointed)
 
 
 # ------------------------------------------------------------------ loss
@@ -207,23 +219,37 @@ def _newest_valid_local(out: Path) -> tuple[Path, ck.CkptMeta] | None:
     return None
 
 
+def _download_first_usable(backup: DriveBackup, candidates: list[ck.CkptMeta], out: Path) -> tuple[Path, ck.CkptMeta]:
+    """Download the newest candidate that verifies (each tried twice), else raise."""
+    for meta in candidates:
+        for attempt in (1, 2):
+            try:
+                return backup.download(meta, out), meta
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Drive download of %s failed (attempt %d/2): %s", meta.name, attempt, exc)
+    raise ResumeError(
+        f"Drive has newer checkpoints ({', '.join(m.name for m in candidates)}) than {out} "
+        "but none could be downloaded and verified; refusing to resume from an older state"
+    )
+
+
 def resolve_resume(cfg: ZipformerTrainConfig, backup: DriveBackup | None) -> Path | None:
     """Newest complete checkpoint of local `output_dir` and Drive (downloaded if newer)."""
     out = Path(cfg.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     local = _newest_valid_local(out)
-    remote = None
+    remote_metas: list[ck.CkptMeta] = []
     if backup is not None:
         try:
-            remote = backup.latest_remote()
-        except Exception as exc:  # noqa: BLE001 - Drive trouble must not block a local resume
+            remote_metas = backup.remote_complete_metas()
+        except Exception as exc:  # noqa: BLE001 - a listing failure must not block a local resume
             log.warning("cannot list Drive checkpoints (%s); using local ones only", exc)
+    newer = [m for m in remote_metas if local is None or m.sort_key() > local[1].sort_key()]
     chosen, source = (local, "local") if local is not None else (None, "none")
-    if remote is not None and (local is None or remote.sort_key() > local[1].sort_key()):
-        try:
-            chosen, source = (backup.download(remote, out), remote), "drive"
-        except Exception as exc:  # noqa: BLE001
-            log.warning("cannot download %s from Drive (%s); using local", remote.name, exc)
+    if newer:
+        # Drive is known to be ahead: never fall back to an older local state (or
+        # scratch), which would later overwrite the real run's checkpoints on Drive.
+        chosen, source = (_download_first_usable(backup, newer, out), "drive")
     if backup is not None:
         try:
             backup.download_missing_epochs(out)
@@ -384,6 +410,7 @@ def _train_batches(
     autocast = cfg.bf16 and device.type == "cuda"
 
     def save_batch_ckpt() -> None:
+        _check_finite_weights(model, st)
         ckpt = make_checkpoint(model, opt, sched, st, loader.sampler, cfg)
         st.sampler_state = ckpt["sampler"]
         save_and_backup(ckpt, "batch", cfg, backup)
@@ -405,9 +432,11 @@ def _train_batches(
             finite = bool(torch.isfinite(loss))
             if finite:
                 loss.backward()
+                st.nonfinite_streak = 0
             else:
-                log.warning("non-finite loss at batch %d; skipping step (cuts: %s)",
-                            st.batch_idx_train, [c.id for c in cuts])
+                st.nonfinite_streak += 1
+                log.warning("non-finite loss at batch %d (%d in a row); skipping step (cuts: %s)",
+                            st.batch_idx_train, st.nonfinite_streak, [c.id for c in cuts])
             sched.step_batch(st.batch_idx_train)
             if finite:
                 opt.step()
@@ -425,6 +454,11 @@ def _train_batches(
                     },
                     st.batch_idx_train,
                 )
+            if st.nonfinite_streak >= MAX_NONFINITE_BATCHES:
+                raise DivergedTraining(
+                    f"{st.nonfinite_streak} consecutive non-finite losses at batch_idx_train="
+                    f"{st.batch_idx_train}; not saving, resume from the last checkpoint"
+                )
             saved = st.batch_idx_train % cfg.save_every_n_batches == 0
             if saved:
                 save_batch_ckpt()
@@ -441,6 +475,13 @@ def _train_batches(
         _close_loader(loader, it)
 
 
+def _check_finite_weights(model, st: TrainState) -> None:
+    """Refuse to checkpoint NaN/inf weights (pruning would then drop the good ones)."""
+    bad = [name for name, p in model.named_parameters() if not torch.isfinite(p).all()]
+    if bad:
+        raise DivergedTraining(f"non-finite weights at batch_idx_train={st.batch_idx_train}: {bad[:5]}")
+
+
 def train_one_epoch(model, opt, sched, loader, st: TrainState, cfg, tokens, device, logger, backup, stop_flag) -> TrainState:
     _train_batches(model, opt, sched, loader, st, cfg, tokens, device, logger, backup, stop_flag)
     return st
@@ -453,7 +494,15 @@ def _evaluated_epochs(out: Path) -> set[int]:
     path = out / DEV_METRICS
     if not path.exists():
         return set()
-    return {json.loads(line)["epoch"] for line in path.read_text().splitlines() if line.strip()}
+    epochs = set()
+    for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            epochs.add(int(json.loads(line)["epoch"]))
+        except (ValueError, KeyError, TypeError):
+            log.warning("skipping unparsable line %d of %s: %.80r", n, path, line)
+    return epochs
 
 
 def _dev_eval(model, cfg, dev_cuts: CutSet, tokens, device, epoch: int, batch_idx_train: int, logger) -> dict:
@@ -463,8 +512,11 @@ def _dev_eval(model, cfg, dev_cuts: CutSet, tokens, device, epoch: int, batch_id
     finally:
         _close_loader(loader)
     row = {"epoch": epoch, "batch_idx_train": batch_idx_train, **metrics}
-    with open(Path(cfg.output_dir) / DEV_METRICS, "a", encoding="utf-8") as f:
-        f.write(json.dumps(row) + "\n")
+    path = Path(cfg.output_dir) / DEV_METRICS
+    # a crash mid-append can leave a line without "\n"; never glue a new row onto it
+    torn = path.exists() and path.stat().st_size > 0 and not path.read_bytes().endswith(b"\n")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(("\n" if torn else "") + json.dumps(row) + "\n")
     log.info("dev epoch %d: %s", epoch, metrics)
     logger.log({f"dev/{k}": v for k, v in metrics.items()}, batch_idx_train)
     return row
@@ -489,6 +541,7 @@ def _dev_eval_missing(cfg, dev_cuts: CutSet, tokens, device, before_epoch: int, 
 
 def _finish_epoch(model, opt, sched, st: TrainState, cfg, backup, dev_cuts, tokens, device, logger) -> None:
     """Save the epoch checkpoint, dev-evaluate, advance `st` to the next epoch."""
+    _check_finite_weights(model, st)
     save_and_backup(make_checkpoint(model, opt, sched, st, None, cfg), "epoch", cfg, backup)
     _dev_eval(model, cfg, dev_cuts, tokens, device, st.epoch, st.batch_idx_train, logger)
     st.epoch += 1
@@ -549,6 +602,10 @@ def run_training(cfg: ZipformerTrainConfig, data_dir: Path, tokens: PhonemeToken
                 st = train_one_epoch(model, opt, sched, loader, st, cfg, tokens, device, logger, backup, stop_flag)
                 del loader
                 _finish_epoch(model, opt, sched, st, cfg, backup, dev_cuts, tokens, device, logger)
+                if stop_flag.is_set():  # e.g. SIGTERM during dev eval; epoch ckpt already saved
+                    if backup is not None and not backup.flush(cfg.shutdown_flush_seconds):
+                        log.warning("Drive upload not finished within %ss", cfg.shutdown_flush_seconds)
+                    raise TrainingInterrupted(f"stopped after epoch {st.epoch - 1}")
         else:
             log.info("all %d epochs already complete; averaging only", cfg.num_epochs)
     finally:

@@ -7,6 +7,7 @@ paths are relative to `data_dir`.
 
 import copy
 import random
+import signal
 import warnings
 from pathlib import Path
 from typing import Literal
@@ -89,6 +90,18 @@ def _dataset(cfg: ZipformerTrainConfig, noise_aug: CutSet | None) -> K2SpeechRec
     )
 
 
+def _ignore_stop_signals(worker_id: int) -> None:
+    """DataLoader `worker_init_fn`: workers ignore SIGINT/SIGTERM.
+
+    A Ctrl-C or preemption SIGTERM goes to the whole process group; spawned
+    workers do not inherit the trainer's handlers and would die, crashing the
+    main loop before it can save. The main process owns the graceful stop and
+    shuts the workers down itself.
+    """
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+
 def _loader(cfg: ZipformerTrainConfig, ds, sampler) -> DataLoader:
     return DataLoader(
         ds,
@@ -96,6 +109,7 @@ def _loader(cfg: ZipformerTrainConfig, ds, sampler) -> DataLoader:
         batch_size=None,
         num_workers=cfg.num_workers,
         persistent_workers=cfg.num_workers > 0,
+        worker_init_fn=_ignore_stop_signals if cfg.num_workers > 0 else None,
     )
 
 
