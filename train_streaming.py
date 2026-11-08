@@ -54,6 +54,7 @@ from prepare_quran_dataset.modeling_fastconformer_cache_aware import (
     FastConformerMelProcessor,
     infer_fastconformer_streaming,
 )
+from prepare_quran_dataset.zipformer.moshaf_ways import build_special_moshaf_attrs
 from prepare_quran_dataset.modeling_streaming_rnn.modeling_rnn_streaming_multi_level_ctc import (
     Wav2Vec2BertForRNNStreamingMultilevelCTC,
     Wav2Vec2BertForRNNStreamingMultilevelCTCConfig,
@@ -1015,35 +1016,6 @@ class StreamingTrainer(Trainer):
         )
 
 
-def prepare_special_moshaf_ways(
-    moshaf_id_to_moshaf_attr: dict[str, dict],
-) -> dict[str, dict[str, MoshafAttributes]]:
-    moshaf_id_to_seg_moshaf_attr = {
-        "6.0": {
-            "010.0158": MoshafAttributes(
-                **(moshaf_id_to_moshaf_dict["6.0"] | {"tasheel_or_madd": "tasheel"})
-            ),
-            "027.0107": MoshafAttributes(
-                **(moshaf_id_to_moshaf_dict["6.0"] | {"tasheel_or_madd": "tasheel"})
-            ),
-            "010.0140": MoshafAttributes(
-                **(moshaf_id_to_moshaf_dict["6.0"] | {"tasheel_or_madd": "tasheel"})
-            ),
-            "010.0233": MoshafAttributes(
-                **(moshaf_id_to_moshaf_dict["6.0"] | {"tasheel_or_madd": "tasheel"})
-            ),
-            "012.0023": MoshafAttributes(
-                **(moshaf_id_to_moshaf_dict["6.0"] | {"noon_tamnna": "rawm"})
-            ),
-            "026.0076": MoshafAttributes(
-                **(moshaf_id_to_moshaf_dict["6.0"] | {"raa_firq": "tarqeeq"})
-            ),
-        }
-    }
-
-    return moshaf_id_to_seg_moshaf_attr
-
-
 def run_qdat_bench_test(
     model: Wav2Vec2BertForRNNStreamingMultilevelCTC
     | FastConformerCacheAwareMultilevelCTC,
@@ -1609,7 +1581,7 @@ if __name__ == "__main__":
         split="train",
     )
     moshaf_id_to_moshaf_dict = {ex["id"]: ex for ex in moshaf_dataeet}
-    special_moshaf_id_to_seg_to_moshaf_attr = prepare_special_moshaf_ways(
+    special_moshaf_id_to_seg_to_moshaf_attr = build_special_moshaf_attrs(
         moshaf_id_to_moshaf_dict
     )
     moshaf_id_to_moshaf_attr = {
