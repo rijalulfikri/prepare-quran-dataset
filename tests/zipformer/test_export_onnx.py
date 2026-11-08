@@ -20,7 +20,8 @@ def test_export_and_streaming_decode_matches_torch(tmp_path, tiny_cfg_factory, t
     assert dec.out_frames_per_chunk == 8 // factor
     assert dec.frame_shift_s == pytest.approx(0.02 * factor)
     wav = np.random.randn(16000 * 2).astype("float32") * 0.1
-    ex.assert_onnx_matches_torch(model, dec, [wav], tokens, chunk_size=8, left_context=32)
+    stats = ex.assert_onnx_matches_torch(model, dec, [wav], tokens, chunk_size=8, left_context=32)
+    assert stats == {"frame_agreement": 1.0, "token_per": 0.0}
     assert isinstance(dec.decode(wav), list)
 
 

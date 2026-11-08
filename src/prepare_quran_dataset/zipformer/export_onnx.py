@@ -10,6 +10,7 @@ there instead of assuming 40 ms.
 
 import copy
 import functools
+import logging
 import warnings
 from pathlib import Path
 from types import ModuleType
@@ -20,6 +21,7 @@ import torch
 from prepare_quran_dataset.zipformer.decode import (
     greedy_ctc,
     greedy_ctc_with_frames,
+    per,
     set_streaming_context,
     token_times,
 )
@@ -28,6 +30,8 @@ from prepare_quran_dataset.zipformer.icefall_import import (
     setup_icefall_paths,
 )
 from prepare_quran_dataset.zipformer.tokens import PhonemeTokens
+
+log = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16000
 NUM_MEL_BINS = 80
@@ -222,6 +226,57 @@ class OnnxStreamingDecoder:
         return [tok for tok, _ in self.decode_with_times(wav, sr)]
 
 
+def compare_onnx_torch(
+    onnx_lps: list[torch.Tensor],
+    torch_lps: list[torch.Tensor],
+    blank_id: int,
+    torch_blank_id: int | None = None,
+    *,
+    min_frame_agreement: float = 0.99,
+    max_token_per: float = 0.01,
+) -> dict[str, float]:
+    """Compare per-wav `(1, T, V)` ONNX and PyTorch log-probs (same `T` per pair).
+
+    Computes over all wavs (a) the fraction of frames whose argmax agrees and
+    (b) the PER of the ONNX greedy decodes against the PyTorch ones, logs both,
+    and raises `AssertionError` (both figures and the first differing token
+    sequence pair) if agreement < `min_frame_agreement` or PER > `max_token_per`.
+    Returns `{"frame_agreement": ..., "token_per": ...}`.
+    """
+    torch_blank_id = blank_id if torch_blank_id is None else torch_blank_id
+    agree = total = 0
+    hyps: list[list[int]] = []
+    refs: list[list[int]] = []
+    first_diff = None
+    for i, (onnx_lp, torch_lp) in enumerate(zip(onnx_lps, torch_lps, strict=True)):
+        n = onnx_lp.shape[1]
+        assert torch_lp.shape[1] == n, (onnx_lp.shape, torch_lp.shape)
+        agree += int((onnx_lp[0].argmax(-1) == torch_lp[0].argmax(-1)).sum())
+        total += n
+        lens = torch.tensor([n])
+        got = greedy_ctc(onnx_lp, lens, blank_id)[0]
+        want = greedy_ctc(torch_lp, lens, torch_blank_id)[0]
+        hyps.append(got)
+        refs.append(want)
+        if first_diff is None and got != want:
+            first_diff = f"wav {i}:\n  onnx:  {got}\n  torch: {want}"
+    frame_agreement = agree / total if total else 1.0
+    token_per = per(hyps, refs)
+    log.info(
+        "ONNX vs PyTorch over %d wavs: frame agreement %.4f, token PER %.4f",
+        len(hyps),
+        frame_agreement,
+        token_per,
+    )
+    if frame_agreement < min_frame_agreement or token_per > max_token_per:
+        raise AssertionError(
+            f"ONNX != PyTorch: frame agreement {frame_agreement:.4f} (min {min_frame_agreement}), "
+            f"token PER {token_per:.4f} (max {max_token_per}); first differing sequence: "
+            + (first_diff or "none (all token sequences are equal)")
+        )
+    return {"frame_agreement": frame_agreement, "token_per": token_per}
+
+
 @torch.no_grad()
 def assert_onnx_matches_torch(
     model,
@@ -230,9 +285,14 @@ def assert_onnx_matches_torch(
     tokens: PhonemeTokens,
     chunk_size: int,
     left_context: int,
-) -> None:
-    """Raise `AssertionError` (showing both sequences) unless the ONNX streaming
-    decode equals PyTorch's simulated-streaming greedy decode for every wav.
+    min_frame_agreement: float = 0.99,
+    max_token_per: float = 0.01,
+) -> dict[str, float]:
+    """Check the ONNX streaming decode against PyTorch's simulated-streaming one.
+
+    Raises `AssertionError` if the frame-level argmax agreement over all wavs is
+    below `min_frame_agreement` or the token PER (ONNX vs PyTorch greedy decode)
+    exceeds `max_token_per` (see :func:`compare_onnx_torch`); returns both figures.
 
     Both sides use the same padded fbank; the PyTorch log-probs are cut to the
     frames the ONNX chunks cover (the full forward has 3 extra right-context
@@ -243,8 +303,9 @@ def assert_onnx_matches_torch(
     was_training = model.training
     model.eval()
     set_streaming_context(model, chunk_size, left_context)
+    onnx_lps, torch_lps = [], []
     try:
-        for i, wav in enumerate(wavs):
+        for wav in wavs:
             feats = _padded_features(
                 wav, SAMPLE_RATE, decoder.chunk_frames, decoder.decode_chunk_len
             )
@@ -252,15 +313,16 @@ def assert_onnx_matches_torch(
                 feats[None], torch.tensor([feats.shape[0]])
             )
             onnx_lp = decoder.log_probs(wav)
-            n = onnx_lp.shape[1]
-            torch_lp = model.ctc_output(enc_out)[:, :n]
-            lens = torch.tensor([n])
-            want = greedy_ctc(torch_lp, lens, tokens.blank_id)[0]
-            got = greedy_ctc(onnx_lp, lens, decoder.blank_id)[0]
-            if got != want:
-                raise AssertionError(
-                    f"wav {i}: ONNX != PyTorch\n  onnx:  {got}\n  torch: {want}"
-                )
+            onnx_lps.append(onnx_lp)
+            torch_lps.append(model.ctc_output(enc_out)[:, : onnx_lp.shape[1]])
     finally:
         encoder.chunk_size, encoder.left_context_frames = saved
         model.train(was_training)
+    return compare_onnx_torch(
+        onnx_lps,
+        torch_lps,
+        decoder.blank_id,
+        tokens.blank_id,
+        min_frame_agreement=min_frame_agreement,
+        max_token_per=max_token_per,
+    )

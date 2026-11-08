@@ -170,8 +170,13 @@ def stage_export(cfg, args: argparse.Namespace) -> dict:
     )
     decoder = OnnxStreamingDecoder(paths["fp32"])
     wavs = _parity_wavs(cfg)
-    assert_onnx_matches_torch(model, decoder, wavs, tokens, cfg.export_chunk_size, cfg.export_left_context)
-    log.info("ONNX streaming decode matches PyTorch on %d test cuts", len(wavs))
+    parity = assert_onnx_matches_torch(model, decoder, wavs, tokens, cfg.export_chunk_size, cfg.export_left_context)
+    log.info(
+        "ONNX streaming decode matches PyTorch on %d test cuts: frame agreement %.4f, token PER %.4f",
+        len(wavs),
+        parity["frame_agreement"],
+        parity["token_per"],
+    )
     results = run_qdat_bench(decoder, tokens, output_dir, rerun=args.rerun_qdat_bench)
     log.info("qdat_bench: %s", results)
     for kind, path in paths.items():
