@@ -1,0 +1,3 @@
+[submodule "external/icefall"]
+	path = external/icefall
+	url = https://github.com/k2-fsa/icefall
