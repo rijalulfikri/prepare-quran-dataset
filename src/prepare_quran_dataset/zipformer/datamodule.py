@@ -6,25 +6,32 @@ paths are relative to `data_dir`.
 """
 
 import copy
+import functools
+import logging
 import random
 import signal
 import warnings
 from pathlib import Path
 from typing import Literal
 
+import lhotse
 from lhotse import CutSet, Fbank, FbankConfig, MonoCut
 from lhotse.dataset import (
     CutMix,
     DynamicBucketingSampler,
     K2SpeechRecognitionDataset,
     OnTheFlyFeatures,
+    SpecAugment,
 )
+from lhotse.dataset.dataloading import worker_init_fn as lhotse_worker_init_fn
 from torch import Tensor
 from torch.utils.data import DataLoader
 
 from prepare_quran_dataset.zipformer.config import ZipformerTrainConfig
 
 Split = Literal["train", "dev", "test", "noise_aug"]
+
+log = logging.getLogger(__name__)
 
 
 def load_cuts(data_dir: Path, split: Split) -> CutSet:
@@ -74,24 +81,47 @@ def _sampler(cuts: CutSet, max_duration: float, **kwargs) -> DynamicBucketingSam
         )
 
 
-def _dataset(cfg: ZipformerTrainConfig, noise_aug: CutSet | None) -> K2SpeechRecognitionDataset:
+def _dataset(
+    cfg: ZipformerTrainConfig, noise_aug: CutSet | None, train: bool
+) -> K2SpeechRecognitionDataset:
+    """Fbank dataset; `train` adds SpecAugment (eval datasets get no augmentation)."""
     transforms = []
     if noise_aug is not None and len(noise_aug) > 0:
         # noise cuts carry an empty "silence" supervision; mixed in, it would add a
         # second supervision (and a bogus "" target) to the speech cut
         noise = noise_aug.drop_supervisions()
         transforms.append(
-            CutMix(cuts=noise, p=cfg.cutmix_p, snr=cfg.cutmix_snr, preserve_id=True)
+            CutMix(
+                cuts=noise,
+                p=cfg.cutmix_p,
+                snr=cfg.cutmix_snr,
+                preserve_id=True,
+                # per-worker RNG: with a fixed seed every persistent worker would
+                # draw the same noise / SNR sequence
+                seed="randomized",
+            )
+        )
+    input_transforms = []
+    if train:
+        input_transforms.append(  # icefall's defaults
+            SpecAugment(
+                time_warp_factor=80,
+                num_frame_masks=10,
+                features_mask_size=27,
+                num_feature_masks=2,
+                frames_mask_size=100,
+            )
         )
     return K2SpeechRecognitionDataset(
         input_strategy=OnTheFlyFeatures(Fbank(FbankConfig(num_mel_bins=cfg.feature_dim))),
         cut_transforms=transforms,
+        input_transforms=input_transforms,
         return_cuts=True,
     )
 
 
 def _ignore_stop_signals(worker_id: int) -> None:
-    """DataLoader `worker_init_fn`: workers ignore SIGINT/SIGTERM.
+    """Workers ignore SIGINT/SIGTERM.
 
     A Ctrl-C or preemption SIGTERM goes to the whole process group; spawned
     workers do not inherit the trainer's handlers and would die, crashing the
@@ -102,6 +132,13 @@ def _ignore_stop_signals(worker_id: int) -> None:
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
 
+def _init_worker(worker_id: int, seed: int) -> None:
+    """DataLoader `worker_init_fn`: ignore stop signals and give each worker its
+    own RNG seed (Lhotse's `worker_init_fn`, required by `CutMix(seed="randomized")`)."""
+    _ignore_stop_signals(worker_id)
+    lhotse_worker_init_fn(worker_id, seed=seed)
+
+
 def _loader(cfg: ZipformerTrainConfig, ds, sampler) -> DataLoader:
     return DataLoader(
         ds,
@@ -109,7 +146,7 @@ def _loader(cfg: ZipformerTrainConfig, ds, sampler) -> DataLoader:
         batch_size=None,
         num_workers=cfg.num_workers,
         persistent_workers=cfg.num_workers > 0,
-        worker_init_fn=_ignore_stop_signals if cfg.num_workers > 0 else None,
+        worker_init_fn=functools.partial(_init_worker, seed=cfg.seed) if cfg.num_workers > 0 else None,
     )
 
 
@@ -130,12 +167,22 @@ def restore_sampler(
     happen mid-epoch). `load_state_dict` mutates its input, hence the deepcopy.
     """
     state = copy.deepcopy(state)
-    diag = state["diagnostics"]
-    epoch = int(diag["current_epoch"])
+    try:
+        diag = state["diagnostics"]
+        epoch = int(diag["current_epoch"])
+        # a JSON round-trip turns the int epoch keys into strings; Lhotse looks them up by int
+        per_epoch = {int(k): v for k, v in diag["stats_per_epoch"].items()}
+        stats = per_epoch[epoch]
+        missing = {"kept_batches", "discarded_batches"} - set(stats)
+    except (KeyError, TypeError, ValueError, AttributeError):
+        missing = {"diagnostics.current_epoch / stats_per_epoch[current_epoch]"}
+    if missing:
+        raise RuntimeError(
+            "Lhotse sampler state layout changed; resume positioning needs updating "
+            f"(lhotse {lhotse.__version__}; missing {sorted(missing)})"
+        )
     diag["current_epoch"] = epoch
-    # a JSON round-trip turns the int epoch keys into strings; Lhotse looks them up by int
-    diag["stats_per_epoch"] = {int(k): v for k, v in diag["stats_per_epoch"].items()}
-    stats = diag["stats_per_epoch"][epoch]
+    diag["stats_per_epoch"] = per_epoch
     stats["kept_batches"] = batches_consumed
     stats["discarded_batches"] = 0
     sampler.load_state_dict(state)
@@ -156,14 +203,18 @@ def train_dataloader(
     `loader.sampler.state_dict()`) and the number of batches the training loop
     consumed to resume mid-epoch.
     """
+    log.info("rebuilding training cuts for epoch %d (may take a few minutes)…", epoch)
     train_cuts = _train_cuts(cfg, data_dir, cuts)
     sampler = _sampler(
         train_cuts, cfg.max_duration, shuffle=True, drop_last=True, seed=cfg.seed
     )
     sampler.set_epoch(epoch)
     if sampler_state is not None:
+        log.info("fast-forwarding sampler by %d batches…", batches_consumed)
         restore_sampler(sampler, sampler_state, batches_consumed)
-    return _loader(cfg, _dataset(cfg, load_cuts(data_dir, "noise_aug")), sampler)
+    return _loader(
+        cfg, _dataset(cfg, load_cuts(data_dir, "noise_aug"), train=True), sampler
+    )
 
 
 def eval_dataloader(
@@ -172,7 +223,7 @@ def eval_dataloader(
     """Unshuffled loader over every cut of `cuts`, no augmentation."""
     max_duration = max_duration if max_duration is not None else cfg.max_duration
     sampler = _sampler(cuts, max_duration, shuffle=False, drop_last=False)
-    return _loader(cfg, _dataset(cfg, None), sampler)
+    return _loader(cfg, _dataset(cfg, None, train=False), sampler)
 
 
 def batch_to_tensors(batch: dict) -> tuple[Tensor, Tensor, list[str], list[MonoCut]]:
