@@ -105,6 +105,7 @@ def test_epoch_checkpoint_resumes_next_epoch(tiny_model, cfg):
 class _FakeBackup:
     def __init__(self, pending):
         self.pending, self.submitted, self.flushed = set(pending), [], []
+        self.consecutive_failures, self.last_error = 0, None
 
     def submit(self, pt):
         self.submitted.append(pt)
@@ -347,3 +348,28 @@ def test_signal_to_process_group_stops_gracefully(tmp_path, tiny_cfg, tiny_data_
     stopped_at = int(re.search(r"stopped at batch_idx_train=(\d+)", stderr).group(1))
     path, meta = ck.latest_complete(out)
     assert path.name == f"checkpoint-{stopped_at}.pt" and meta.batch_idx_train == stopped_at >= 2
+
+
+def test_backup_health():
+    from types import SimpleNamespace
+
+    assert tl.backup_health(SimpleNamespace(consecutive_failures=0, last_error="old")) == "backup: ok"
+    assert (
+        tl.backup_health(SimpleNamespace(consecutive_failures=4, last_error="quota exceeded"))
+        == "backup: FAILING (4 consecutive, last error quota exceeded)"
+    )
+
+
+def test_finish_epoch_logs_backup_health(monkeypatch, caplog):
+    from types import SimpleNamespace
+
+    for name in ("_check_finite_weights", "save_and_backup", "make_checkpoint", "_dev_eval"):
+        monkeypatch.setattr(tl, name, lambda *a, **k: None)
+    st = tl.TrainState(epoch=2)
+    backup = SimpleNamespace(consecutive_failures=3, last_error="quota exceeded")
+    with caplog.at_level("INFO", logger=tl.__name__):
+        tl._finish_epoch(None, None, None, st, None, backup, None, None, None, None)
+        tl._finish_epoch(None, None, None, st, None, None, None, None, None, None)
+    assert "epoch 2 finished; backup: FAILING (3 consecutive, last error quota exceeded)" in caplog.text
+    assert "epoch 3 finished" not in caplog.text  # no backup configured -> no health line
+    assert st.epoch == 4

@@ -1,5 +1,6 @@
 import logging
 import shutil
+import subprocess
 import threading
 
 import pytest
@@ -219,3 +220,50 @@ def test_pending_paths_reports_queued_and_in_flight_then_empty(tmp_path, remote)
     gate.set()
     assert bk.flush(60)
     assert bk.pending_paths() == set()
+
+
+def test_deletefile_bypasses_drive_trash(monkeypatch):
+    # a trashed checkpoint still counts against the Drive quota
+    seen = []
+
+    def fake_run(self, args, timeout):
+        seen.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(Rclone, "_run", fake_run)
+    Rclone().deletefile("gdrive:ckpt/checkpoint-2000.pt")
+    assert seen == [["deletefile", "--drive-use-trash=false", "gdrive:ckpt/checkpoint-2000.pt"]]
+
+
+class _FlakyRclone:
+    def __init__(self):
+        self.fail = True
+
+    def copyto(self, src, dst, timeout):
+        if self.fail:
+            raise RcloneError("quota exceeded")
+
+    def lsjson(self, remote_dir, timeout=60):
+        return []
+
+
+def test_consecutive_upload_failures_escalate_to_error_then_reset(tmp_path, caplog):
+    rc = _FlakyRclone()
+    bk = DriveBackup("gdrive:ckpt", keep_last_k=3, timeout=10, rclone=rc)
+    _save(tmp_path, "epoch", 10, 1)
+    pt = tmp_path / ck.ckpt_name("epoch", 10, 1)
+    errors_after = []
+    with caplog.at_level(logging.WARNING):
+        for n in (1, 2, 3, 4):
+            bk.submit(pt)
+            assert bk.flush(30)
+            assert bk.consecutive_failures == n
+            errors_after.append(sum(r.levelname == "ERROR" for r in caplog.records))
+    assert errors_after == [0, 0, 1, 2]
+    msg = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"][0]
+    assert msg == "drive backup has failed 3 times in a row; last error: quota exceeded"
+    rc.fail = False
+    bk.submit(pt)
+    assert bk.flush(30)
+    assert bk.consecutive_failures == 0
+    assert bk.last_error == "quota exceeded"

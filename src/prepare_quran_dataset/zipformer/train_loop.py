@@ -539,11 +539,20 @@ def _dev_eval_missing(cfg, dev_cuts: CutSet, tokens, device, before_epoch: int, 
         _dev_eval(model.to(device), cfg, dev_cuts, tokens, device, epoch, int(ckpt["batch_idx_train"]), logger)
 
 
+def backup_health(backup: DriveBackup) -> str:
+    if backup.consecutive_failures == 0:
+        return "backup: ok"
+    return f"backup: FAILING ({backup.consecutive_failures} consecutive, last error {backup.last_error})"
+
+
 def _finish_epoch(model, opt, sched, st: TrainState, cfg, backup, dev_cuts, tokens, device, logger) -> None:
     """Save the epoch checkpoint, dev-evaluate, advance `st` to the next epoch."""
     _check_finite_weights(model, st)
     save_and_backup(make_checkpoint(model, opt, sched, st, None, cfg), "epoch", cfg, backup)
     _dev_eval(model, cfg, dev_cuts, tokens, device, st.epoch, st.batch_idx_train, logger)
+    if backup is not None:
+        health = backup_health(backup)
+        (log.info if backup.consecutive_failures == 0 else log.warning)("epoch %d finished; %s", st.epoch, health)
     st.epoch += 1
     st.batches_consumed_in_epoch = 0
     st.sampler_state = None

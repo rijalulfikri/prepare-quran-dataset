@@ -20,6 +20,7 @@ from prepare_quran_dataset.zipformer import checkpointing as ck
 log = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT = 300.0
+FAILURES_BEFORE_ERROR = 3  # consecutive failed uploads before logging at ERROR
 
 
 class RcloneError(RuntimeError):
@@ -70,7 +71,9 @@ class Rclone:
         return proc.stdout
 
     def deletefile(self, remote_file: str, timeout: float = _DEFAULT_TIMEOUT) -> None:
-        args = ["deletefile", remote_file]
+        # Drive moves deleted files to the trash, where they still count against
+        # the quota; backend flags are accepted globally (ignored by other remotes)
+        args = ["deletefile", "--drive-use-trash=false", remote_file]
         self._check(self._run(args, timeout), args)
 
 
@@ -89,6 +92,7 @@ class DriveBackup:
         self.timeout = timeout
         self._rclone = rclone or Rclone()
         self.last_error: str | None = None
+        self.consecutive_failures = 0  # failed uploads since the last success
         self._pending: list[tuple[Path, bool]] = []  # (pt, is_batch)
         self._in_flight: Path | None = None
         self._cond = threading.Condition()
@@ -134,7 +138,16 @@ class DriveBackup:
                 self._upload(pt)
             except Exception as exc:  # noqa: BLE001 - the backup must never kill training
                 self.last_error = str(exc)
+                self.consecutive_failures += 1
                 log.warning("drive backup of %s failed: %s", pt, exc)
+                if self.consecutive_failures >= FAILURES_BEFORE_ERROR:
+                    log.error(
+                        "drive backup has failed %d times in a row; last error: %s",
+                        self.consecutive_failures,
+                        self.last_error,
+                    )
+            else:
+                self.consecutive_failures = 0
             finally:
                 with self._cond:
                     self._in_flight = None
