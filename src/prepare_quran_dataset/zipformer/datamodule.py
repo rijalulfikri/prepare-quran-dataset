@@ -6,6 +6,7 @@ paths are relative to `data_dir`.
 """
 
 import copy
+import random
 import warnings
 from pathlib import Path
 from typing import Literal
@@ -39,11 +40,16 @@ def _train_cuts(
     """Training cuts (`cuts` or the train manifest), x3 with speed perturbation.
 
     Perturbed ids get Lhotse's `_sp0.9` / `_sp1.1` suffix, so ids stay unique.
+    The concatenation is shuffled once with `cfg.seed`: DynamicBucketingSampler
+    only shuffles within a streaming buffer and fits bucket edges to the first
+    cuts, so block order would put all 0.9x audio first in every epoch. The
+    fixed seed keeps the order identical across runs, so resume stays exact.
     """
     base = cuts if cuts is not None else load_cuts(data_dir, "train")
     if not cfg.speed_perturb:
         return base
-    return CutSet.from_cuts([*base.perturb_speed(0.9), *base, *base.perturb_speed(1.1)])
+    combined = CutSet.from_cuts([*base.perturb_speed(0.9), *base, *base.perturb_speed(1.1)])
+    return combined.shuffle(rng=random.Random(cfg.seed))
 
 
 def _num_buckets(cuts: CutSet, max_duration: float) -> int:

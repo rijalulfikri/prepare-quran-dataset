@@ -55,6 +55,17 @@ def test_speed_perturb_triples_cut_count(tiny_data_dir, cfg):
     assert len(dm._train_cuts(cfg, tiny_data_dir)) == 3 * n
 
 
+def test_train_cuts_are_globally_shuffled_and_deterministic(tiny_data_dir_big, cfg):
+    # block order [sp0.9, base, sp1.1] would skew bucket edges and batch order
+    base = dm.load_cuts(tiny_data_dir_big, "train")
+    blocks = [c.id for c in [*base.perturb_speed(0.9), *base, *base.perturb_speed(1.1)]]
+    first = [c.id for c in dm._train_cuts(cfg, tiny_data_dir_big)]
+    second = [c.id for c in dm._train_cuts(cfg, tiny_data_dir_big)]
+    assert first == second
+    assert sorted(first) == sorted(blocks)
+    assert first != blocks
+
+
 def _ids(batch):
     return [c.id for c in batch["supervisions"]["cut"]]
 
