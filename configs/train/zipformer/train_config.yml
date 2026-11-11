@@ -22,6 +22,7 @@ train_moshaf_ids:
   - "22.0"
   - "24.0"
   - "26.0"
+  - "26.1"
   - "27.0"
   - "28.0"
 test_moshaf_ids:
@@ -76,14 +77,14 @@ output_dir: "./results-zipformer-v0"
 # ---- eval / export ----
 export_chunk_size: 24          # must be one of chunk_size
 export_left_context: 256
-hub_model_id: "obadx/muaalem-zipformer-ctc-v0"
-wandb_project_name: "muaalem-zipformer-ctc-v0"
+hub_model_id: "rijalulfikri/utluma-zipformer-ctc-v0"
+wandb_project_name: "utluma-zipformer-ctc-v0"
 
 # ---- frame budget ----
 max_dropped_fraction: 0.01     # abort train if more speech cuts fail the CTC frame check
 
 # ---- fault tolerance ----
 save_every_n_batches: 2000
-rclone_checkpoint_path: "gdrive:muaalem-zipformer-data/checkpoints/muaalem-zipformer-ctc-v0"  # null disables Drive backup
+rclone_checkpoint_path: "gdrive:RClone/Utluma/zipformer-data/checkpoints/utluma-zipformer-ctc-v0"  # null disables Drive backup
 upload_timeout_seconds: 1800
 shutdown_flush_seconds: 120
