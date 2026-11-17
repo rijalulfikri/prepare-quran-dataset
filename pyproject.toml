@@ -107,4 +107,4 @@ Issues = "https://github.com/obadx/prepare-quran-dataset/issues"
 [tool.setuptools.package-data]
 quran_transcript = ["data/*"]
 [tool.pyrefly]
-search-path = [".", "zipformer/server_controller"]
+search-path = [".", "zipformer/vastai"]
