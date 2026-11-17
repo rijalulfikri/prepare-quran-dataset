@@ -15,6 +15,12 @@ Satu skrip dari komputer lokal untuk menjalankan langkah 3 README Zipformer
 6. Jalankan `bash train_zipformer.sh` di sesi tmux `zipformer`, dengan log di
    ~/train_zipformer.log, sehingga training tetap berjalan walau SSH putus.
 
+Dengan --destroy-when-done, setelah train_zipformer.sh sukses (exit 0) box
+menjalankan upload_results_and_destroy.sh: output_dir di-upload ke Drive
+(--results-remote, default <rclone_checkpoint_path>-results), diverifikasi, lalu
+instance Vast.ai dihapus. Jika training gagal/berhenti atau upload gagal,
+instance dibiarkan hidup.
+
 Skrip ini aman dijalankan ulang, termasuk di box baru setelah box lama mati:
 train_zipformer.sh melanjutkan dari checkpoint terbaru di Google Drive.
 
@@ -23,7 +29,7 @@ running pertama, bisa difilter --label; butuh VAST_API_KEY dan paket `vastai`).
 
 Contoh:
     python zipformer/vastai/run_zipformer_training.py --host 45.81.32.13 --port 23330 --follow
-    python zipformer/vastai/run_zipformer_training.py --label zipformer --auto-restart
+    python zipformer/vastai/run_zipformer_training.py --label zipformer --auto-restart --destroy-when-done
     python zipformer/vastai/run_zipformer_training.py --host ... --port ... -- --push-to-hub
 
 Prasyarat:
@@ -46,6 +52,8 @@ DEFAULT_REPO_URL = "https://github.com/rijalulfikri/prepare-quran-dataset.git"
 REMOTE_REPO_DIR = "/root/prepare-quran-dataset"
 REMOTE_LOG = "/root/train_zipformer.log"
 TMUX_SESSION = "zipformer"
+FINISH_SCRIPT = "upload_results_and_destroy.sh"
+REMOTE_FINISH_SCRIPT = f"/root/{FINISH_SCRIPT}"
 K2_VARS = ("K2_WHEEL_URL", "K2_WHEEL_URL_CP312")
 
 
@@ -133,8 +141,8 @@ def check_local_prerequisites(args):
               f"({remote_head[:7]}). Box akan melatih {remote_head[:7]}; push dulu jika perlu.")
 
 
-def build_launch_command(args):
-    """Command bash di box untuk menjalankan train_zipformer.sh di sesi tmux."""
+def build_train_command(args):
+    """Command bash yang dijalankan di dalam sesi tmux: training (+ upload & destroy)."""
     exports = [f"export {k}={shlex.quote(os.environ[k])}" for k in K2_VARS if os.getenv(k)]
     if args.auto_restart:
         exports.append("export AUTO_RESTART=1")
@@ -148,7 +156,21 @@ def build_launch_command(args):
         *exports,
         f"{train_cmd} 2>&1 | tee -a {REMOTE_LOG}",
     ])
-    inner = f"set -o pipefail; {inner}; echo \"[train_zipformer.sh selesai, exit code $?]\" | tee -a {REMOTE_LOG}"
+    inner = f"set -o pipefail; {inner}; code=$?; echo \"[train_zipformer.sh selesai, exit code $code]\" | tee -a {REMOTE_LOG}"
+    if args.destroy_when_done:
+        finish_env = [f"REPO_ZIPFORMER_DIR={REMOTE_REPO_DIR}/zipformer"]
+        if args.results_remote:
+            finish_env.append(f"RESULTS_REMOTE={shlex.quote(args.results_remote)}")
+        inner += (
+            f"; if [ $code -eq 0 ]; then {' '.join(finish_env)} bash {REMOTE_FINISH_SCRIPT} 2>&1 | tee -a {REMOTE_LOG}; "
+            f"else echo '[--destroy-when-done: training tidak sukses, instance dibiarkan hidup]' | tee -a {REMOTE_LOG}; fi"
+        )
+    return inner
+
+
+def build_launch_command(args):
+    """Command bash di box untuk menjalankan build_train_command() di sesi tmux."""
+    inner = build_train_command(args)
     return (
         f"if tmux has-session -t {TMUX_SESSION} 2>/dev/null; then "
         f"echo 'Error: sesi tmux {TMUX_SESSION} sudah ada (training mungkin masih jalan). "
@@ -171,6 +193,11 @@ def main():
     parser.add_argument("--rclone-conf", default=os.path.expanduser("~/.config/rclone/rclone.conf"))
     parser.add_argument("--auto-restart", action="store_true",
                         help="set AUTO_RESTART=1 (ulangi training maks 3x jika crash)")
+    parser.add_argument("--destroy-when-done", action="store_true",
+                        help="setelah training sukses: upload output_dir ke Drive lalu hapus instance Vast.ai")
+    parser.add_argument("--results-remote",
+                        help="tujuan upload hasil untuk --destroy-when-done "
+                             "(default: <rclone_checkpoint_path>-results)")
     parser.add_argument("--follow", action="store_true",
                         help="tampilkan log training setelah dijalankan (Ctrl+C tidak menghentikan training)")
     parser.add_argument("--dry-run", action="store_true", help="cetak command tanpa menjalankannya")
@@ -211,11 +238,14 @@ def main():
     run_command(scp + [args.rclone_conf, f"root@{host}:/root/.config/rclone/rclone.conf"], dry)
     run_command(ssh + ["chmod 600 /root/.config/rclone/rclone.conf"], dry)
 
-    print("\n[5/6] Kirim .env")
+    print("\n[5/6] Kirim .env" + (f" dan {FINISH_SCRIPT}" if args.destroy_when_done else ""))
     if os.path.isfile(args.env_file):
         run_command(scp + [args.env_file, f"root@{host}:{REMOTE_REPO_DIR}/zipformer/.env"], dry)
     else:
         print("Dilewati (.env lokal tidak ada).")
+    if args.destroy_when_done:
+        # Dikirim dari lokal (bukan dari clone) supaya tidak bergantung pada commit yang sudah di-push
+        run_command(scp + [os.path.join(SCRIPT_DIR, FINISH_SCRIPT), f"root@{host}:{REMOTE_FINISH_SCRIPT}"], dry)
 
     print(f"\n[6/6] Jalankan train_zipformer.sh di sesi tmux '{TMUX_SESSION}'")
     run_command(ssh + [build_launch_command(args)], dry)
@@ -224,7 +254,11 @@ def main():
     print("\n--- ✓ Training berjalan di box ---")
     print(f"  Lihat log      : {ssh_str} 'tail -f {REMOTE_LOG}'")
     print(f"  Attach tmux    : {ssh_str} -t 'tmux attach -t {TMUX_SESSION}'")
-    print(f"  Ambil hasil    : scp -P {port} -r root@{host}:{REMOTE_REPO_DIR}/zipformer/results-zipformer-v0/export ./")
+    if args.destroy_when_done:
+        dest = args.results_remote or "<rclone_checkpoint_path>-results"
+        print(f"  Setelah sukses : hasil di-upload ke {dest}, lalu instance dihapus")
+    else:
+        print(f"  Ambil hasil    : scp -P {port} -r root@{host}:{REMOTE_REPO_DIR}/zipformer/results-zipformer-v0/export ./")
 
     if args.follow:
         print("\nMenampilkan log (Ctrl+C hanya menghentikan tampilan log, bukan training)...\n")
