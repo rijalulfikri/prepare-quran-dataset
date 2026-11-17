@@ -12,7 +12,7 @@ def test_default_yaml_loads_and_matches_v3_dims():
     assert c.encoder_dim == "192,256,384,512,384,256"
     assert c.chunk_size == "8,16,24" and c.left_context_frames == "64,128,256"
     assert c.test_moshaf_ids == ["19.0", "29.0", "30.0"]
-    assert len(c.train_moshaf_ids) == 22
+    assert len(c.train_moshaf_ids) == 23
 
 
 def test_export_chunk_must_be_trained():
