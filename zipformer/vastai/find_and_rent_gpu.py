@@ -80,7 +80,7 @@ def find_cheapest_offer(gpu, max_price, offer_type="bid"):
 # --- KONFIGURASI ---
 GPU_MODEL = None#"RTX_3090"
 MAX_PRICE = 0.321        # DPH (Dollar per hour)
-DISK_SPACE = 20         
+DISK_SPACE = 150         
 IMAGE_TAG = "K2FSA"    # Nama Docker image yang dicari
 OFFER_TYPE = "on-demand"     # "bid" (interruptible) atau "on-demand"
 # IMAGE_TAG = "pytorch/pytorch"

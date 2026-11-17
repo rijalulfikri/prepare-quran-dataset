@@ -72,8 +72,12 @@ bash train_zipformer.sh
 Atau jalankan semuanya dari komputer lokal dengan satu perintah (clone repo, kirim `rclone.conf` dan `.env`, lalu `train_zipformer.sh` berjalan di sesi tmux `zipformer` dengan log di `~/train_zipformer.log` di box):
 
 ```bash
-python vastai/run_zipformer_training.py --host <IP_VAST_AI> --port <PORT> --follow
-# tanpa --host/--port: instance running pertama dari Vast.ai API (VAST_API_KEY, opsional --label)
+python vastai/run_zipformer_training.py --offer-id <OFFER_ID> --follow
+# --offer-id: buat instance baru (default image pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime,
+#   disk 150 GB, label zipformer; ubah dengan --image / --disk / --label), tunggu SSH siap, lalu training
+# atau box yang sudah ada: --host <IP_VAST_AI> --port <PORT>
+# tanpa --offer-id/--host/--port: instance running pertama dari Vast.ai API (opsional --label)
+# --offer-id dan mode API butuh VAST_API_KEY dan paket vastai di lokal
 # argumen untuk train_zipformer.sh setelah "--", mis.: ... -- --push-to-hub
 ```
 
