@@ -50,7 +50,7 @@ def test_roundtrip(tmp_path):
 def test_fault_tolerance_defaults():
     c = ZipformerTrainConfig.from_yaml(YAML)
     assert c.save_every_n_batches == 2000 and c.keep_last_k == 3
-    assert c.rclone_checkpoint_path.startswith("gdrive:")
+    assert c.rclone_checkpoint_path.startswith("utluma:")
     default = ZipformerTrainConfig(train_moshaf_ids=["0.0"], test_moshaf_ids=[])
     assert default.rclone_checkpoint_path is None
 

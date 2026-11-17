@@ -2,7 +2,7 @@
 
 Idempotent: re-run after a dead session and finished configs are skipped.
 
-    python prepare_zipformer_data_colab.py --drive-root /content/drive/MyDrive/muaalem-zipformer-data
+    python prepare_zipformer_data_colab.py --drive-root /content/drive/MyDrive/RClone/Utluma/zipformer-data
     python prepare_zipformer_data_colab.py --drive-root ... --only moshaf_6.0 --only noise
 """
 

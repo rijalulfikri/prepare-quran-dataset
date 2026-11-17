@@ -25,10 +25,10 @@ Alurnya: data disiapkan sekali di Google Colab dan disimpan di Google Drive → 
 3. Jalankan semua sel. Notebook me-mount Drive, meng-clone repo ini, lalu dari folder `zipformer/` menjalankan:
 
    ```bash
-   python prepare_zipformer_data_colab.py --drive-root /content/drive/MyDrive/muaalem-zipformer-data
+   python prepare_zipformer_data_colab.py --drive-root /content/drive/MyDrive/RClone/Utluma/zipformer-data
    ```
 
-   Hasilnya (FLAC + manifest Lhotse `cuts_train/dev/test/noise_aug.jsonl.gz`) ditulis ke folder Drive `muaalem-zipformer-data` (~60 GB).
+   Hasilnya (FLAC + manifest Lhotse `cuts_train/dev/test/noise_aug.jsonl.gz`) ditulis ke folder Drive `MyDrive/RClone/Utluma/zipformer-data` (~60 GB).
 4. Aman dijalankan ulang jika sesi Colab mati: config yang sudah selesai (marker `.done`) dilewati. Untuk memproses sebagian saja: `--only moshaf_6.0 --only noise`.
 
 ## 2. Buat remote rclone Google Drive
@@ -36,26 +36,23 @@ Alurnya: data disiapkan sekali di Google Colab dan disimpan di Google Drive → 
 Buat remote di komputer lokal (yang punya browser), lalu salin `rclone.conf` ke box:
 
 ```bash
-rclone config
-#   n) New remote
-#   name> gdrive            # harus sama dengan prefix di rclone_remote_path
-#   Storage> drive          # Google Drive
-#   scope> drive            # akses penuh (perlu untuk upload checkpoint)
-#   lainnya: default; login lewat browser
-rclone lsd gdrive:          # harus menampilkan folder muaalem-zipformer-data
+rclone config create utluma drive scope=drive   # login lewat browser
+rclone lsd utluma:RClone/Utluma/zipformer-data  # harus menampilkan audio/ dan manifests/
 ```
+
+Nama remote (`utluma`) harus sama dengan prefix di `rclone_remote_path` dan `rclone_checkpoint_path`. Scope harus `drive` (akses penuh): dengan `drive.file` rclone hanya melihat file yang dibuat rclone sendiri, sehingga data buatan Colab tidak terlihat. Jangan set `root_folder_id`; path di config relatif terhadap root My Drive.
 
 File konfigurasinya ada di `~/.config/rclone/rclone.conf` (cek dengan `rclone config file`). Jika box tidak punya browser dan Anda mengonfigurasi langsung di box, jawab `n` pada "Use web browser to automatically authenticate" lalu jalankan `rclone authorize "drive"` di komputer lokal.
 
-`train_zipformer.sh` menerima salah satu dari tiga sumber konfigurasi rclone: file `~/.config/rclone/rclone.conf`, file yang ditunjuk `RCLONE_CONFIG=/path/ke/rclone.conf`, atau remote yang didefinisikan lewat environment (`RCLONE_CONFIG_<REMOTE>_TYPE=drive` beserta `RCLONE_CONFIG_<REMOTE>_TOKEN` dst., mis. `RCLONE_CONFIG_GDRIVE_TYPE=drive`).
+`train_zipformer.sh` menerima salah satu dari tiga sumber konfigurasi rclone: file `~/.config/rclone/rclone.conf`, file yang ditunjuk `RCLONE_CONFIG=/path/ke/rclone.conf`, atau remote yang didefinisikan lewat environment (`RCLONE_CONFIG_<REMOTE>_TYPE=drive` beserta `RCLONE_CONFIG_<REMOTE>_TOKEN` dst., mis. `RCLONE_CONFIG_UTLUMA_TYPE=drive`).
 
 Field terkait di config:
 
 | Field | Default | Keterangan |
 |---|---|---|
-| `rclone_remote_path` | `gdrive:muaalem-zipformer-data` | sumber data untuk `--stage prepare` (`rclone sync` ke `data_dir`) |
+| `rclone_remote_path` | `utluma:RClone/Utluma/zipformer-data` | sumber data untuk `--stage prepare` (`rclone sync` ke `data_dir`) |
 | `data_dir` | `./data-zipformer` | lokasi data lokal di box |
-| `rclone_checkpoint_path` | `gdrive:muaalem-zipformer-data/checkpoints/muaalem-zipformer-ctc-v0` | backup checkpoint ke Drive; `null` menonaktifkan backup |
+| `rclone_checkpoint_path` | `null` (di `train_config.yml`: `utluma:RClone/Utluma/zipformer-data/checkpoints/utluma-zipformer-ctc-v0`) | backup checkpoint ke Drive; `null` menonaktifkan backup |
 
 **Waktu sinkronisasi data.** Dataset berisi ~250–300 ribu file FLAC kecil, dan Google Drive membatasi jumlah request per detik, sehingga `rclone sync` pertama bisa memakan waktu berjam-jam, bukan 30–60 menit. Ukur waktu sync untuk satu moshaf saat smoke run (Task 12) sebelum memutuskan layout data ini; perkiraan waktu "setup" di bagian [Jika box Vast.ai mati di tengah training](#jika-box-vastai-mati-di-tengah-training) bergantung pada hasil pengukuran tersebut.
 
@@ -64,7 +61,7 @@ Field terkait di config:
 Sewa box dengan 1 GPU NVIDIA (mis. RTX 4090) dan disk yang cukup untuk data (~60 GB), environment, dan checkpoint, lalu:
 
 ```bash
-git clone https://github.com/obadx/prepare-quran-dataset.git && cd prepare-quran-dataset/zipformer
+git clone https://github.com/rijalulfikri/prepare-quran-dataset.git && cd prepare-quran-dataset/zipformer
 mkdir -p ~/.config/rclone
 # dari komputer lokal:
 #   scp -P <PORT> ~/.config/rclone/rclone.conf root@<IP_VAST_AI>:~/.config/rclone/rclone.conf

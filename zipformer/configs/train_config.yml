@@ -36,7 +36,7 @@ noise_aug_ratio: 0.3           # fraction of noise cuts mixed in (data prep)
 max_noise_input_seconds: 40.0  # upper bound of noise input length
 min_noise_input_seconds: 1.0   # lower bound of noise input length
 data_dir: "./data-zipformer"
-rclone_remote_path: "gdrive:muaalem-zipformer-data"
+rclone_remote_path: "utluma:RClone/Utluma/zipformer-data"
 
 # ---- model (comma lists: one entry per encoder stack) ----
 num_encoder_layers: "2,2,3,4,3,2"
@@ -85,6 +85,6 @@ max_dropped_fraction: 0.01     # abort train if more speech cuts fail the CTC fr
 
 # ---- fault tolerance ----
 save_every_n_batches: 2000
-rclone_checkpoint_path: "gdrive:RClone/Utluma/zipformer-data/checkpoints/utluma-zipformer-ctc-v0"  # null disables Drive backup
+rclone_checkpoint_path: "utluma:RClone/Utluma/zipformer-data/checkpoints/utluma-zipformer-ctc-v0"  # null disables Drive backup
 upload_timeout_seconds: 1800
 shutdown_flush_seconds: 120

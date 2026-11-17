@@ -18,7 +18,7 @@ class ZipformerTrainConfig(BaseModel):
     max_noise_input_seconds: float = 40.0
     min_noise_input_seconds: float = 1.0
     data_dir: str = "./data-zipformer"
-    rclone_remote_path: str = "gdrive:muaalem-zipformer-data"
+    rclone_remote_path: str = "utluma:RClone/Utluma/zipformer-data"
 
     # --- model (icefall-style comma lists, one entry per encoder stack) ---
     num_encoder_layers: str = "2,2,3,4,3,2"

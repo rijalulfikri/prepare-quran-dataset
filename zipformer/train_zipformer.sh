@@ -143,8 +143,8 @@ else
     echo "  - salin rclone.conf dari komputer lokal, mis.:"
     echo "      scp -P <PORT> ~/.config/rclone/rclone.conf root@<IP_VAST_AI>:~/.config/rclone/rclone.conf"
     echo "  - set RCLONE_CONFIG=/path/ke/rclone.conf"
-    echo "  - definisikan remote lewat environment, mis. RCLONE_CONFIG_GDRIVE_TYPE=drive"
-    echo "      RCLONE_CONFIG_GDRIVE_SCOPE=drive RCLONE_CONFIG_GDRIVE_TOKEN='<json token>'"
+    echo "  - definisikan remote lewat environment, mis. RCLONE_CONFIG_UTLUMA_TYPE=drive"
+    echo "      RCLONE_CONFIG_UTLUMA_SCOPE=drive RCLONE_CONFIG_UTLUMA_TOKEN='<json token>'"
     exit 1
 fi
 if [ ! -f ".env" ] && [ ! -f "$REPO_ROOT/.env" ]; then
