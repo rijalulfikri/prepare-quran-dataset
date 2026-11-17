@@ -69,6 +69,16 @@ mkdir -p ~/.config/rclone
 bash train_zipformer.sh
 ```
 
+Atau jalankan semuanya dari komputer lokal dengan satu perintah (clone repo, kirim `rclone.conf` dan `.env`, lalu `train_zipformer.sh` berjalan di sesi tmux `zipformer` dengan log di `~/train_zipformer.log` di box):
+
+```bash
+python vastai/run_zipformer_training.py --host <IP_VAST_AI> --port <PORT> --follow
+# tanpa --host/--port: instance running pertama dari Vast.ai API (VAST_API_KEY, opsional --label)
+# argumen untuk train_zipformer.sh setelah "--", mis.: ... -- --push-to-hub
+```
+
+Box meng-clone branch `--branch` (default `main`) dari GitHub, jadi push dulu commit yang ingin dilatih. `K2_WHEEL_URL` / `K2_WHEEL_URL_CP312` dibaca dari `zipformer/.env`.
+
 `train_zipformer.sh` melakukan, dan semua langkahnya idempotent:
 
 1. Berhenti sebelum membuat venv atau menginstall torch jika `K2_WHEEL_URL` dan `K2_WHEEL_URL_CP312` masih placeholder. Membuat `.venv-zipformer` (Python 3.14; fallback 3.12 dengan `PYTHONPATH=<repo>/src` jika wheel k2 untuk cp314 tidak ada), menginstall torch 2.9.1, k2 (`K2_WHEEL_URL`, pilih wheel di https://k2-fsa.github.io/k2/cuda.html), `requirements-zipformer.txt`, `pip install -e ..` (paket `prepare_quran_dataset` di root repo; hanya di Python 3.14; fallback 3.12 memakai `PYTHONPATH=<repo>/src` karena `pyproject.toml` mensyaratkan Python >=3.14), cek import modul training/qdat_bench (gagal dalam hitungan menit jika ada dependency yang kurang), dan submodule `external/icefall`.
