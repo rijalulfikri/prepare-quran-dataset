@@ -106,3 +106,5 @@ Issues = "https://github.com/obadx/prepare-quran-dataset/issues"
 # # for addint data: https://setuptools.pypa.io/en/latest/userguide/datafiles.html#package-data
 [tool.setuptools.package-data]
 quran_transcript = ["data/*"]
+[tool.pyrefly]
+search-path = [".", "zipformer/server_controller"]

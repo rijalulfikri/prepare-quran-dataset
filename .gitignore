@@ -27,3 +27,4 @@ recordings/
 .claude/*
 rclone.conf
 .superpowers/
+.vscode/launch.json
