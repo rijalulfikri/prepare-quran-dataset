@@ -54,7 +54,7 @@ from prepare_quran_dataset.modeling_fastconformer_cache_aware import (
     FastConformerMelProcessor,
     infer_fastconformer_streaming,
 )
-from prepare_quran_dataset.zipformer.moshaf_ways import build_special_moshaf_attrs
+from prepare_quran_dataset.moshaf_ways import build_special_moshaf_attrs
 from prepare_quran_dataset.modeling_streaming_rnn.modeling_rnn_streaming_multi_level_ctc import (
     Wav2Vec2BertForRNNStreamingMultilevelCTC,
     Wav2Vec2BertForRNNStreamingMultilevelCTCConfig,

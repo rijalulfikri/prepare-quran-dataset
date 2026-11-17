@@ -25,8 +25,5 @@ frontend/temp/
 .gradio
 recordings/
 .claude/*
-data-zipformer/
-results-zipformer*/
 rclone.conf
-.venv-test/
 .superpowers/
