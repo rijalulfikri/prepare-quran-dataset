@@ -13,7 +13,8 @@ Semua kode training Zipformer berakar di folder `zipformer/` ini; semua path di 
 | `requirements-zipformer.txt` | dependency training |
 | `external/icefall` | submodule icefall (`git submodule update --init external/icefall`) |
 | `tests/` | test (`pytest` dari folder ini) |
-| `docs/` | spec desain dan rencana implementasi (dokumen historis; path di dalamnya masih layout lama `src/prepare_quran_dataset/zipformer/`) |
+
+Spec desain dan rencana implementasi tetap di `docs/superpowers/` di root repo (lokasi yang dipakai skill superpowers): `specs/2026-11-08-zipformer2-ctc-training-design.md` dan `plans/2026-11-08-zipformer2-ctc-training.md`. Keduanya dokumen historis; path di dalamnya masih layout lama `src/prepare_quran_dataset/zipformer/`.
 
 Alurnya: data disiapkan sekali di Google Colab dan disimpan di Google Drive → box GPU Vast.ai menyalin data dari Drive dengan `rclone`, training, evaluasi, lalu export.
 
