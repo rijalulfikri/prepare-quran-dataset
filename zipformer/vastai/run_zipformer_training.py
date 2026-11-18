@@ -28,11 +28,17 @@ Box ditentukan dengan salah satu cara:
 - --offer-id: buat instance baru dari offer tersebut (image --image, disk --disk,
   label --label), tunggu sampai SSH siap, lalu lanjut seperti biasa.
 - --host/--port: box yang sudah ada.
-- tanpa keduanya: instance running pertama dari Vast.ai API (bisa difilter --label).
---offer-id dan tanpa --host/--port butuh VAST_API_KEY dan paket `vastai`.
+- --host saja: port SSH instance dengan IP tersebut dicari lewat Vast.ai API.
+- tanpa keduanya: instance running/loading pertama dari Vast.ai API (bisa
+  difilter --label).
+Tanpa --port, skrip menunggu (maks --wait-timeout detik) sampai instance yang
+cocok muncul dengan info SSH, lalu menunggu SSH siap.
+Semua cara selain --host + --port butuh VAST_API_KEY dan paket `vastai`.
 
 Contoh:
+    python zipformer/vastai/run_zipformer_training.py --destroy-when-done --follow
     python zipformer/vastai/run_zipformer_training.py --offer-id 12345678 --destroy-when-done --follow
+    python zipformer/vastai/run_zipformer_training.py --host 45.81.32.13 --follow
     python zipformer/vastai/run_zipformer_training.py --host 45.81.32.13 --port 23330 --follow
     python zipformer/vastai/run_zipformer_training.py --label zipformer --auto-restart --destroy-when-done
     python zipformer/vastai/run_zipformer_training.py --host ... --port ... -- --push-to-hub
@@ -74,6 +80,7 @@ DEFAULT_LABEL = "zipformer"
 # Supaya CONTAINER_ID / CONTAINER_API_KEY terbaca di sesi SSH (dipakai --destroy-when-done)
 ONSTART_CMD = "env >> /etc/environment"
 SSH_READY_TIMEOUT = 600
+INSTANCE_WAIT_TIMEOUT = 1800
 
 
 def run_command(command, dry_run=False, check=True):
@@ -107,17 +114,18 @@ def read_env_keys(env_path):
 
 
 def resolve_box(args):
-    """Kembalikan (host, port, created_instance_id) box.
+    """Kembalikan (host, port, created_instance_id, from_api) box.
 
-    created_instance_id hanya terisi jika instance baru dibuat dari --offer-id.
+    created_instance_id hanya terisi jika instance baru dibuat dari --offer-id;
+    from_api True jika port didapat dari Vast.ai API (SSH mungkin belum siap).
     """
     if args.offer_id is not None and (args.host or args.port):
         print("Error: --offer-id tidak bisa digabung dengan --host/--port.")
         sys.exit(1)
     if args.host and args.port:
-        return args.host, str(args.port), None
-    if args.host or args.port:
-        print("Error: --host dan --port harus diisi bersamaan.")
+        return args.host, str(args.port), None, False
+    if args.port:
+        print("Error: --port butuh --host.")
         sys.exit(1)
 
     # Import di sini supaya --host/--port tidak butuh paket vastai / VAST_API_KEY
@@ -127,7 +135,7 @@ def resolve_box(args):
     if args.offer_id is not None:
         if args.dry_run:
             print(f"(dry run) instance dari offer {args.offer_id} tidak dibuat; memakai host contoh.")
-            return "<IP_INSTANCE_BARU>", "<PORT>", None
+            return "<IP_INSTANCE_BARU>", "<PORT>", None, False
         info = create_instance_with_ssh_info(
             offer_id=args.offer_id,
             image=args.image,
@@ -140,15 +148,45 @@ def resolve_box(args):
             print("Cek https://cloud.vast.ai/instances/ ; hapus manual jika instance sempat dibuat.")
             sys.exit(1)
         print(f"Instance {info['instance_id']} dibuat: {info['ip']}:{info['ssh_port']}")
-        return info["ip"], str(info["ssh_port"]), info["instance_id"]
+        return info["ip"], str(info["ssh_port"]), info["instance_id"], True
 
     label = args.label or os.getenv("VAST_LABEL")
-    info = get_first_started_instance(label)
+    info = wait_for_instance(get_first_started_instance, label, args.host, args.wait_timeout, args.dry_run)
+    if not info and args.dry_run:
+        print("(dry run) instance belum ada; tidak ditunggu, memakai host contoh.")
+        return args.host or "<IP_INSTANCE>", "<PORT>", None, False
     if not info:
-        print("Error: tidak ada instance Vast.ai yang running. Isi --host/--port atau --offer-id.")
+        print("Error: tidak ada instance Vast.ai running/loading yang cocok. "
+              "Isi --host/--port, --offer-id, atau naikkan --wait-timeout.")
         sys.exit(1)
     print(f"Instance {info['instance_id']}: {info['ip']}:{info['ssh_port']}")
-    return info["ip"], str(info["ssh_port"]), None
+    return info["ip"], str(info["ssh_port"]), None, True
+
+
+def wait_for_instance(lookup, label, ip, timeout, dry_run=False, interval=15):
+    """Poll Vast.ai sampai ada instance running/loading (filter label/IP) dengan info SSH.
+
+    Returns:
+        dict | None: hasil lookup(), atau None jika timeout (atau tidak ketemu saat dry run).
+    """
+    desc = " dan ".join(f for f in [label and f"label '{label}'", ip and f"IP {ip}"] if f)
+    print(f"Mencari instance Vast.ai{' dengan ' + desc if desc else ''}...")
+    deadline = time.monotonic() + timeout
+    waited = False
+    while True:
+        info = lookup(label, ip, verbose=False)
+        if info or dry_run:
+            if waited:
+                print()
+            return info
+        if time.monotonic() >= deadline:
+            print()
+            return None
+        remaining = int(deadline - time.monotonic())
+        print(f"  belum ada instance yang siap; cek lagi dalam {interval} detik (sisa {remaining} detik)...",
+              end="\r", flush=True)
+        waited = True
+        time.sleep(interval)
 
 
 def wait_for_ssh(ssh, timeout=SSH_READY_TIMEOUT, interval=15):
@@ -269,8 +307,11 @@ def main():
     parser.add_argument("--image", default=DEFAULT_IMAGE, help=f"Docker image untuk --offer-id (default: {DEFAULT_IMAGE})")
     parser.add_argument("--disk", type=float, default=DEFAULT_DISK,
                         help=f"disk (GB) untuk --offer-id (default: {DEFAULT_DISK:g})")
-    parser.add_argument("--host", help="IP / hostname SSH box (default: dari Vast.ai API)")
-    parser.add_argument("--port", help="port SSH box (default: dari Vast.ai API)")
+    parser.add_argument("--host", help="IP / hostname SSH box (default: instance pertama dari Vast.ai API)")
+    parser.add_argument("--port", help="port SSH box (default: dari Vast.ai API, dicari berdasarkan --host jika diisi)")
+    parser.add_argument("--wait-timeout", type=int, default=INSTANCE_WAIT_TIMEOUT,
+                        help="tanpa --port: lama menunggu instance yang cocok muncul, dalam detik "
+                             f"(default: {INSTANCE_WAIT_TIMEOUT})")
     parser.add_argument("--label", help=f"label instance baru untuk --offer-id (default: {DEFAULT_LABEL}), "
                                         "atau filter instance saat memakai Vast.ai API (default: VAST_LABEL)")
     parser.add_argument("--identity", default=os.path.expanduser("~/.ssh/id_rsa"), help="private key SSH")
@@ -293,9 +334,9 @@ def main():
     args = parser.parse_args()
 
     check_local_prerequisites(args)
-    host, port, created_id = resolve_box(args)
+    host, port, created_id, from_api = resolve_box(args)
     try:
-        launch_training(args, host, port, wait_ssh=created_id is not None)
+        launch_training(args, host, port, wait_ssh=from_api and not args.dry_run)
     except SystemExit as exc:
         if created_id is not None and exc.code:
             print(f"\nPERINGATAN: instance {created_id} sudah dibuat dan masih berjalan (ditagih).")

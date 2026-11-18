@@ -443,24 +443,38 @@ def get_instances():
         return None
 
 
-def get_first_started_instance(target_label: str = None):
+def _direct_ssh_port(instance: dict):
+    """Return the host port mapped to the container's port 22, or ``None``."""
+    for mapping in (instance.get("ports") or {}).get("22/tcp") or []:
+        if mapping.get("HostPort"):
+            return int(mapping["HostPort"])
+    return None
+
+
+def get_first_started_instance(target_label: str = None, target_ip: str = None, verbose: bool = True):
     """Return SSH info for the first running or loading instance.
 
     If target_label is provided, only return an instance matching the label.
+    If target_ip is provided, only return an instance reachable at that IP,
+    either as ``ssh_host`` (SSH proxy) or ``public_ipaddr`` (direct SSH).
 
     Returns:
-        dict | None: Dictionary with ``instance_id``, ``ip``, and ``ssh_port``, 
+        dict | None: Dictionary with ``instance_id``, ``ip``, and ``ssh_port``,
         or ``None`` if no running instances are found.
     """
+    filters = []
     if target_label:
-        print(f"[*] Retrieving the first running or loading instance with label {target_label}...")
-    else:
-        print("[*] Retrieving the first running or loading instance...")
-        
+        filters.append(f"label '{target_label}'")
+    if target_ip:
+        filters.append(f"IP {target_ip}")
+    filter_desc = f" with {' and '.join(filters)}" if filters else ""
+    if verbose:
+        print(f"[*] Retrieving the first running or loading instance{filter_desc}...")
+
     instances = get_instances()
     if not instances:
         return None
-        
+
     for target in list(instances):
         status = target.get("actual_status")
         if status not in ["running", "loading"]:
@@ -469,8 +483,17 @@ def get_first_started_instance(target_label: str = None):
         if target_label and target.get("label") != target_label:
             continue
 
-        ip = target.get("ssh_host") or target.get("public_ipaddr")
-        port = target.get("ssh_port")
+        ssh_host = target.get("ssh_host")
+        public_ip = target.get("public_ipaddr")
+        if not target_ip:
+            ip, port = ssh_host or public_ip, target.get("ssh_port")
+        elif target_ip == ssh_host:
+            ip, port = ssh_host, target.get("ssh_port")
+        elif target_ip == public_ip:
+            # Direct SSH: port 22 container di-map ke port lain di host
+            ip, port = public_ip, _direct_ssh_port(target)
+        else:
+            continue
         if ip and port:
             return {
                 "instance_id": target.get("id"),
@@ -480,10 +503,8 @@ def get_first_started_instance(target_label: str = None):
                 "dlperf": target.get("dlperf"),
             }
     
-    if target_label:
-        print(f"    -> No running or loading instances found with label '{target_label}' and valid SSH info.")
-    else:
-        print("    -> No running or loading instances found with valid SSH info.")
+    if verbose:
+        print(f"    -> No running or loading instances found{filter_desc} and valid SSH info.")
     return None
 
 
