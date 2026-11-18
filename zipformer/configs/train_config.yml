@@ -58,7 +58,7 @@ feature_dim: 80                # fbank bins
 
 # ---- training ----
 max_duration: 600              # seconds of audio per batch
-num_workers: 8
+num_workers: 24                # fbank/CutMix/speed perturb run on the fly in workers; leave a few cores for the main process
 num_epochs: 30
 base_lr: 0.045
 lr_batches: 7500
