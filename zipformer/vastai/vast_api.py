@@ -344,14 +344,15 @@ def ssh_endpoint(instance: dict, prefer_direct: bool = True):
     info is available, otherwise the other one.
 
     Returns:
-        tuple: ``(ip, port)``, or ``(None, None)`` if neither is available yet.
+        tuple: ``(ip, port, is_direct)``, or ``(None, None, False)`` if neither
+        is available yet.
     """
-    direct = ((instance.get("public_ipaddr") or "").strip(), _direct_ssh_port(instance))
-    proxy = (instance.get("ssh_host"), instance.get("ssh_port"))
-    for ip, port in ([direct, proxy] if prefer_direct else [proxy, direct]):
+    direct = ((instance.get("public_ipaddr") or "").strip(), _direct_ssh_port(instance), True)
+    proxy = (instance.get("ssh_host"), instance.get("ssh_port"), False)
+    for ip, port, is_direct in ([direct, proxy] if prefer_direct else [proxy, direct]):
         if ip and port:
-            return ip, port
-    return None, None
+            return ip, port, is_direct
+    return None, None, False
 
 
 def create_instance_with_ssh_info(
@@ -385,14 +386,16 @@ def create_instance_with_ssh_info(
         label:         Optional label for the instance.
         poll_interval: Status polling interval in seconds (default: 10).
         timeout:       Maximum time to wait in seconds (default: 600).
-        prefer_direct: ``True`` to return the machine's public IP and mapped
-                       SSH port instead of the ``sshN.vast.ai`` proxy (see
-                       :func:`ssh_endpoint`).
+        prefer_direct: ``True`` to keep polling until the machine's public IP
+                       and mapped SSH port are available, instead of returning
+                       the ``sshN.vast.ai`` proxy as soon as the instance runs
+                       (see :func:`ssh_endpoint`). The proxy is returned only if
+                       the direct endpoint never appears before the timeout.
 
     Returns:
-        dict | None: Dictionary with ``instance_id`` (int), ``ip`` (str), and
-        ``ssh_port`` (int) when the instance is running, or ``None`` on failure
-        or timeout.
+        dict | None: Dictionary with ``instance_id`` (int), ``ip`` (str),
+        ``ssh_port`` (int), and ``direct`` (bool) when the instance is running,
+        or ``None`` on failure or timeout.
 
     Example::
 
@@ -426,6 +429,7 @@ def create_instance_with_ssh_info(
     vast.ARGS = show_args
 
     elapsed = 0
+    proxy_info = None  # cadangan jika endpoint direct tidak muncul sampai timeout
     while elapsed < timeout:
         try:
             instances = vast.show__instances(show_args)
@@ -441,7 +445,7 @@ def create_instance_with_ssh_info(
                     print(f"    -> Status: {status}...", end="\r")
 
                     if status == "running":
-                        ip, port = ssh_endpoint(target, prefer_direct)
+                        ip, port, is_direct = ssh_endpoint(target, prefer_direct)
 
                         if not ip or not port:
                             print(
@@ -449,18 +453,23 @@ def create_instance_with_ssh_info(
                                 f"(ip={ip}, port={port}). Waiting..."
                             )
                         else:
-                            print(f"\n[+] Instance RUNNING!")
-                            # print(f"    Instance ID : {instance_id}")
-                            # print(f"    IP          : {ip}")
-                            # print(f"    SSH Port    : {port}")
-                            # print(f"    SSH Command : ssh -p {port} root@{ip}")
-                            return {
+                            info = {
                                 "instance_id": instance_id,
                                 "ip": ip,
                                 "ssh_port": port,
+                                "direct": is_direct,
                                 "machine_id": target.get("machine_id"),
                                 "dlperf": target.get("dlperf"),
                             }
+                            if is_direct or not prefer_direct:
+                                print(f"\n[+] Instance RUNNING!")
+                                return info
+                            if proxy_info is None:
+                                print(
+                                    f"\n    -> Instance running, only proxy SSH ({ip}:{port}) so far. "
+                                    "Waiting for direct IP/port..."
+                                )
+                            proxy_info = info
 
         except Exception as e:
             print(f"\n    -> Error polling status: {e}")
@@ -469,6 +478,10 @@ def create_instance_with_ssh_info(
         time.sleep(poll_interval)
         elapsed += poll_interval
 
+    if proxy_info:
+        print(f"\n[!] Timeout ({timeout}s) waiting for direct SSH; using proxy "
+              f"{proxy_info['ip']}:{proxy_info['ssh_port']}.")
+        return proxy_info
     print(f"\n[!] Timeout ({timeout}s) reached. Instance {instance_id} is not yet running.")
     return None
 
@@ -501,8 +514,9 @@ def get_first_started_instance(
     Otherwise the endpoint is chosen by :func:`ssh_endpoint` (``prefer_direct``).
 
     Returns:
-        dict | None: Dictionary with ``instance_id``, ``ip``, and ``ssh_port``,
-        or ``None`` if no running instances are found.
+        dict | None: Dictionary with ``instance_id``, ``ip``, ``ssh_port``, and
+        ``direct`` (``False`` for the proxy), or ``None`` if no running
+        instances are found.
     """
     filters = []
     if target_label:
@@ -528,12 +542,12 @@ def get_first_started_instance(
         ssh_host = target.get("ssh_host")
         public_ip = (target.get("public_ipaddr") or "").strip()
         if not target_ip:
-            ip, port = ssh_endpoint(target, prefer_direct)
+            ip, port, is_direct = ssh_endpoint(target, prefer_direct)
         elif target_ip == ssh_host:
-            ip, port = ssh_host, target.get("ssh_port")
+            ip, port, is_direct = ssh_host, target.get("ssh_port"), False
         elif target_ip == public_ip:
             # Direct SSH: port 22 container di-map ke port lain di host
-            ip, port = public_ip, _direct_ssh_port(target)
+            ip, port, is_direct = public_ip, _direct_ssh_port(target), True
         else:
             continue
         if ip and port:
@@ -541,6 +555,7 @@ def get_first_started_instance(
                 "instance_id": target.get("id"),
                 "ip": ip,
                 "ssh_port": port,
+                "direct": is_direct,
                 "machine_id": target.get("machine_id"),
                 "dlperf": target.get("dlperf"),
             }

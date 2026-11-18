@@ -34,7 +34,9 @@ Box ditentukan dengan salah satu cara:
 Tanpa --port, skrip menunggu (maks --wait-timeout detik) sampai instance yang
 cocok muncul dengan info SSH, lalu menunggu SSH siap.
 Instance dari API dihubungi langsung lewat IP publik mesin dan port yang di-map
-ke port 22 container; --ssh-proxy memakai proxy sshN.vast.ai sebagai gantinya.
+ke port 22 container. Selama instance baru punya SSH proxy (sshN.vast.ai), skrip
+terus menunggu endpoint direct; proxy hanya dipakai jika endpoint direct tidak
+muncul sampai timeout. --ssh-proxy langsung memakai proxy.
 Semua cara selain --host + --port butuh VAST_API_KEY dan paket `vastai`.
 
 Contoh:
@@ -156,7 +158,9 @@ def resolve_box(args):
 
     label = args.label or os.getenv("VAST_LABEL")
     lookup = functools.partial(get_first_started_instance, prefer_direct=not args.ssh_proxy)
-    info = wait_for_instance(lookup, label, args.host, args.wait_timeout, args.dry_run)
+    # --host yang diisi sudah menentukan jenis endpoint, jadi tidak perlu menunggu direct
+    require_direct = not args.ssh_proxy and not args.host
+    info = wait_for_instance(lookup, label, args.host, args.wait_timeout, args.dry_run, require_direct)
     if not info and args.dry_run:
         print("(dry run) instance belum ada; tidak ditunggu, memakai host contoh.")
         return args.host or "<IP_INSTANCE>", "<PORT>", None, False
@@ -168,8 +172,12 @@ def resolve_box(args):
     return info["ip"], str(info["ssh_port"]), None, True
 
 
-def wait_for_instance(lookup, label, ip, timeout, dry_run=False, interval=15):
+def wait_for_instance(lookup, label, ip, timeout, dry_run=False, require_direct=False, interval=15):
     """Poll Vast.ai sampai ada instance running/loading (filter label/IP) dengan info SSH.
+
+    Dengan require_direct, instance yang baru punya SSH proxy (sshN.vast.ai) terus
+    ditunggu sampai IP publik + port direct-nya muncul; proxy hanya dipakai jika
+    endpoint direct tidak muncul sampai timeout.
 
     Returns:
         dict | None: hasil lookup(), atau None jika timeout (atau tidak ketemu saat dry run).
@@ -180,15 +188,20 @@ def wait_for_instance(lookup, label, ip, timeout, dry_run=False, interval=15):
     waited = False
     while True:
         info = lookup(label, ip, verbose=False)
-        if info or dry_run:
+        if (info and (info.get("direct") or not require_direct)) or dry_run:
             if waited:
                 print()
             return info
         if time.monotonic() >= deadline:
             print()
-            return None
+            if info:
+                print(f"PERINGATAN: IP/port direct instance {info['instance_id']} tidak muncul dalam "
+                      f"{timeout} detik; memakai SSH proxy.")
+            return info
         remaining = int(deadline - time.monotonic())
-        print(f"  belum ada instance yang siap; cek lagi dalam {interval} detik (sisa {remaining} detik)...",
+        status = (f"instance {info['instance_id']} baru punya SSH proxy, menunggu IP/port direct" if info
+                  else "belum ada instance yang siap")
+        print(f"  {status}; cek lagi dalam {interval} detik (sisa {remaining} detik)...",
               end="\r", flush=True)
         waited = True
         time.sleep(interval)
