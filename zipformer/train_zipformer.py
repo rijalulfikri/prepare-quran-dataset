@@ -104,12 +104,15 @@ def stage_prepare(cfg, args: argparse.Namespace) -> None:
     check_rclone()
     log.info("syncing %s -> %s", cfg.rclone_remote_path, cfg.data_dir)
     # ~250-300 k small FLAC files and a request-rate-limited Drive API: many
-    # parallel transfers/checkers, one recursive listing, a faster pacer
+    # parallel transfers/checkers, one recursive listing, a faster pacer.
+    # checkpoints/ is the Drive checkpoint backup living inside the data folder;
+    # resume fetches what it needs from there itself.
     subprocess.run(
         [
             "rclone", "sync", cfg.rclone_remote_path, str(cfg.data_dir), "--progress",
             "--transfers", "32", "--checkers", "32", "--fast-list",
             "--drive-pacer-min-sleep", "10ms", "--drive-pacer-burst", "200",
+            "--exclude", "/checkpoints/**",
         ],
         check=True,
     )

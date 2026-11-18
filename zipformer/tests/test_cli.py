@@ -95,6 +95,7 @@ def test_prepare_syncs_with_drive_tuned_flags(monkeypatch):
             "rclone", "sync", "gdrive:data", "data-zipformer", "--progress",
             "--transfers", "32", "--checkers", "32", "--fast-list",
             "--drive-pacer-min-sleep", "10ms", "--drive-pacer-burst", "200",
+            "--exclude", "/checkpoints/**",
         ]
     ]
 
