@@ -33,6 +33,8 @@ Box ditentukan dengan salah satu cara:
   difilter --label).
 Tanpa --port, skrip menunggu (maks --wait-timeout detik) sampai instance yang
 cocok muncul dengan info SSH, lalu menunggu SSH siap.
+Instance dari API dihubungi langsung lewat IP publik mesin dan port yang di-map
+ke port 22 container; --ssh-proxy memakai proxy sshN.vast.ai sebagai gantinya.
 Semua cara selain --host + --port butuh VAST_API_KEY dan paket `vastai`.
 
 Contoh:
@@ -50,6 +52,7 @@ Prasyarat:
 """
 
 import argparse
+import functools
 import os
 import re
 import shlex
@@ -142,6 +145,7 @@ def resolve_box(args):
             onstart_cmd=ONSTART_CMD,
             disk=args.disk,
             label=args.label or DEFAULT_LABEL,
+            prefer_direct=not args.ssh_proxy,
         )
         if not info:
             print(f"Error: gagal membuat instance dari offer {args.offer_id} (atau timeout menunggu running).")
@@ -151,7 +155,8 @@ def resolve_box(args):
         return info["ip"], str(info["ssh_port"]), info["instance_id"], True
 
     label = args.label or os.getenv("VAST_LABEL")
-    info = wait_for_instance(get_first_started_instance, label, args.host, args.wait_timeout, args.dry_run)
+    lookup = functools.partial(get_first_started_instance, prefer_direct=not args.ssh_proxy)
+    info = wait_for_instance(lookup, label, args.host, args.wait_timeout, args.dry_run)
     if not info and args.dry_run:
         print("(dry run) instance belum ada; tidak ditunggu, memakai host contoh.")
         return args.host or "<IP_INSTANCE>", "<PORT>", None, False
@@ -312,6 +317,9 @@ def main():
     parser.add_argument("--wait-timeout", type=int, default=INSTANCE_WAIT_TIMEOUT,
                         help="tanpa --port: lama menunggu instance yang cocok muncul, dalam detik "
                              f"(default: {INSTANCE_WAIT_TIMEOUT})")
+    parser.add_argument("--ssh-proxy", action="store_true",
+                        help="hubungi instance dari Vast.ai API lewat proxy sshN.vast.ai, "
+                             "bukan langsung ke IP publik mesin (default: langsung)")
     parser.add_argument("--label", help=f"label instance baru untuk --offer-id (default: {DEFAULT_LABEL}), "
                                         "atau filter instance saat memakai Vast.ai API (default: VAST_LABEL)")
     parser.add_argument("--identity", default=os.path.expanduser("~/.ssh/id_rsa"), help="private key SSH")

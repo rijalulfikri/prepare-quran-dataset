@@ -327,6 +327,33 @@ def create_instance(
         return None
 
 
+def _direct_ssh_port(instance: dict):
+    """Return the host port mapped to the container's port 22, or ``None``."""
+    for mapping in (instance.get("ports") or {}).get("22/tcp") or []:
+        if mapping.get("HostPort"):
+            return int(mapping["HostPort"])
+    return None
+
+
+def ssh_endpoint(instance: dict, prefer_direct: bool = True):
+    """Return ``(ip, port)`` for SSH into an instance dict from ``show instances``.
+
+    Direct SSH goes to the machine's ``public_ipaddr`` on the host port mapped
+    to the container's port 22; proxy SSH goes through ``ssh_host``
+    (``sshN.vast.ai``) on ``ssh_port``. The preferred kind is used when its
+    info is available, otherwise the other one.
+
+    Returns:
+        tuple: ``(ip, port)``, or ``(None, None)`` if neither is available yet.
+    """
+    direct = ((instance.get("public_ipaddr") or "").strip(), _direct_ssh_port(instance))
+    proxy = (instance.get("ssh_host"), instance.get("ssh_port"))
+    for ip, port in ([direct, proxy] if prefer_direct else [proxy, direct]):
+        if ip and port:
+            return ip, port
+    return None, None
+
+
 def create_instance_with_ssh_info(
     offer_id: int,
     image: str,
@@ -338,6 +365,7 @@ def create_instance_with_ssh_info(
     label: str = None,
     poll_interval: int = 10,
     timeout: int = 600,
+    prefer_direct: bool = True,
 ):
     """Create a Vast.ai instance and wait until running, then return SSH info.
 
@@ -357,6 +385,9 @@ def create_instance_with_ssh_info(
         label:         Optional label for the instance.
         poll_interval: Status polling interval in seconds (default: 10).
         timeout:       Maximum time to wait in seconds (default: 600).
+        prefer_direct: ``True`` to return the machine's public IP and mapped
+                       SSH port instead of the ``sshN.vast.ai`` proxy (see
+                       :func:`ssh_endpoint`).
 
     Returns:
         dict | None: Dictionary with ``instance_id`` (int), ``ip`` (str), and
@@ -410,8 +441,7 @@ def create_instance_with_ssh_info(
                     print(f"    -> Status: {status}...", end="\r")
 
                     if status == "running":
-                        ip = target.get("ssh_host") or target.get("public_ipaddr")
-                        port = target.get("ssh_port")
+                        ip, port = ssh_endpoint(target, prefer_direct)
 
                         if not ip or not port:
                             print(
@@ -460,20 +490,15 @@ def get_instances():
         return None
 
 
-def _direct_ssh_port(instance: dict):
-    """Return the host port mapped to the container's port 22, or ``None``."""
-    for mapping in (instance.get("ports") or {}).get("22/tcp") or []:
-        if mapping.get("HostPort"):
-            return int(mapping["HostPort"])
-    return None
-
-
-def get_first_started_instance(target_label: str = None, target_ip: str = None, verbose: bool = True):
+def get_first_started_instance(
+    target_label: str = None, target_ip: str = None, verbose: bool = True, prefer_direct: bool = True
+):
     """Return SSH info for the first running or loading instance.
 
     If target_label is provided, only return an instance matching the label.
     If target_ip is provided, only return an instance reachable at that IP,
     either as ``ssh_host`` (SSH proxy) or ``public_ipaddr`` (direct SSH).
+    Otherwise the endpoint is chosen by :func:`ssh_endpoint` (``prefer_direct``).
 
     Returns:
         dict | None: Dictionary with ``instance_id``, ``ip``, and ``ssh_port``,
@@ -501,9 +526,9 @@ def get_first_started_instance(target_label: str = None, target_ip: str = None, 
             continue
 
         ssh_host = target.get("ssh_host")
-        public_ip = target.get("public_ipaddr")
+        public_ip = (target.get("public_ipaddr") or "").strip()
         if not target_ip:
-            ip, port = ssh_host or public_ip, target.get("ssh_port")
+            ip, port = ssh_endpoint(target, prefer_direct)
         elif target_ip == ssh_host:
             ip, port = ssh_host, target.get("ssh_port")
         elif target_ip == public_ip:
