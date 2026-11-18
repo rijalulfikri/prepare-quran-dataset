@@ -101,6 +101,14 @@ def check_rclone() -> None:
 
 
 def stage_prepare(cfg, args: argparse.Namespace) -> None:
+    if cfg.hf_data_repo:
+        from quran_zipformer.hf_data import fetch_hf_shards
+
+        try:
+            fetch_hf_shards(cfg.hf_data_repo, Path(cfg.data_dir))
+            return
+        except Exception as exc:  # noqa: BLE001 - Drive still has the same data
+            log.warning("fetching data from %s failed (%s); falling back to rclone sync", cfg.hf_data_repo, exc)
     check_rclone()
     log.info("syncing %s -> %s", cfg.rclone_remote_path, cfg.data_dir)
     # ~250-300 k small FLAC files and a request-rate-limited Drive API: many

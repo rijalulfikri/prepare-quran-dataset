@@ -37,6 +37,7 @@ max_noise_input_seconds: 40.0  # upper bound of noise input length
 min_noise_input_seconds: 1.0   # lower bound of noise input length
 data_dir: "./data-zipformer"
 rclone_remote_path: "utluma:RClone/Utluma/zipformer-data"
+hf_data_repo: "rijalulfikri/utluma-zipformer-data"  # tar shards of data_dir; rclone is the fallback (null = rclone only)
 
 # ---- model (comma lists: one entry per encoder stack) ----
 num_encoder_layers: "2,2,3,4,3,2"

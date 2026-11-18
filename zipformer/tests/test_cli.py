@@ -16,7 +16,18 @@ def test_defaults():
     assert a.config.endswith("configs/train_config.yml") and a.stage == "all" and not a.push_to_hub
 
 
-def test_prepare_without_rclone_fails_with_message(monkeypatch, capsys):
+@pytest.fixture
+def hf_unavailable(monkeypatch):
+    """The real config sets hf_data_repo; make the HF fetch fail without network."""
+    from quran_zipformer import hf_data
+
+    def fail(*args, **kwargs):
+        raise OSError("no network in tests")
+
+    monkeypatch.setattr(hf_data, "fetch_hf_shards", fail)
+
+
+def test_prepare_without_rclone_fails_with_message(monkeypatch, capsys, hf_unavailable):
     monkeypatch.setattr(tz.shutil, "which", lambda name: None)
 
     def no_subprocess(*args, **kwargs):
@@ -28,7 +39,7 @@ def test_prepare_without_rclone_fails_with_message(monkeypatch, capsys):
     assert "rclone" in capsys.readouterr().err
 
 
-def test_prepare_without_remote_fails(monkeypatch, capsys):
+def test_prepare_without_remote_fails(monkeypatch, capsys, hf_unavailable):
     monkeypatch.setattr(tz.shutil, "which", lambda name: "/usr/bin/rclone")
     calls = []
 
@@ -88,16 +99,45 @@ def test_prepare_syncs_with_drive_tuned_flags(monkeypatch):
     monkeypatch.setattr(tz, "check_rclone", lambda: None)
     calls = []
     monkeypatch.setattr(tz.subprocess, "run", lambda cmd, **kwargs: calls.append(cmd))
-    cfg = types.SimpleNamespace(rclone_remote_path="gdrive:data", data_dir="data-zipformer")
+    cfg = types.SimpleNamespace(rclone_remote_path="gdrive:data", data_dir="data-zipformer", hf_data_repo=None)
     tz.stage_prepare(cfg, tz.parse_args([]))
-    assert calls == [
-        [
-            "rclone", "sync", "gdrive:data", "data-zipformer", "--progress",
-            "--transfers", "32", "--checkers", "32", "--fast-list",
-            "--drive-pacer-min-sleep", "10ms", "--drive-pacer-burst", "200",
-            "--exclude", "/checkpoints/**",
-        ]
-    ]
+    assert calls == [RCLONE_SYNC]
+
+
+RCLONE_SYNC = [
+    "rclone", "sync", "gdrive:data", "data-zipformer", "--progress",
+    "--transfers", "32", "--checkers", "32", "--fast-list",
+    "--drive-pacer-min-sleep", "10ms", "--drive-pacer-burst", "200",
+    "--exclude", "/checkpoints/**",
+]
+
+
+def _prepare_with_hf(monkeypatch, fetch):
+    from quran_zipformer import hf_data
+
+    monkeypatch.setattr(tz, "check_rclone", lambda: None)
+    calls = []
+    monkeypatch.setattr(tz.subprocess, "run", lambda cmd, **kwargs: calls.append(cmd))
+    monkeypatch.setattr(hf_data, "fetch_hf_shards", fetch)
+    cfg = types.SimpleNamespace(rclone_remote_path="gdrive:data", data_dir="data-zipformer", hf_data_repo="u/data")
+    tz.stage_prepare(cfg, tz.parse_args([]))
+    return calls
+
+
+def test_prepare_uses_hf_shards_without_rclone(monkeypatch):
+    fetched = []
+    calls = _prepare_with_hf(monkeypatch, lambda repo, data_dir: fetched.append((repo, str(data_dir))))
+    assert fetched == [("u/data", "data-zipformer")]
+    assert calls == []
+
+
+def test_prepare_falls_back_to_rclone_when_hf_fails(monkeypatch, caplog):
+    def fail(repo, data_dir):
+        raise OSError("hub down")
+
+    calls = _prepare_with_hf(monkeypatch, fail)
+    assert calls == [RCLONE_SYNC]
+    assert "falling back to rclone sync" in caplog.text
 
 
 class _DotenvLoaded(Exception):

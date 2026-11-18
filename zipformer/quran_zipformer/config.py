@@ -19,6 +19,9 @@ class ZipformerTrainConfig(BaseModel):
     min_noise_input_seconds: float = 1.0
     data_dir: str = "./data-zipformer"
     rclone_remote_path: str = "utluma:RClone/Utluma/zipformer-data"
+    # HF dataset repo with tar shards of data_dir (vastai/pack_data_to_hf.py);
+    # when set, prepare fetches it and uses rclone only as a fallback
+    hf_data_repo: str | None = None
 
     # --- model (icefall-style comma lists, one entry per encoder stack) ---
     num_encoder_layers: str = "2,2,3,4,3,2"

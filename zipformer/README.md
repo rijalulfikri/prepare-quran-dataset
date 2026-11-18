@@ -50,11 +50,19 @@ Field terkait di config:
 
 | Field | Default | Keterangan |
 |---|---|---|
-| `rclone_remote_path` | `utluma:RClone/Utluma/zipformer-data` | sumber data untuk `--stage prepare` (`rclone sync` ke `data_dir`) |
+| `hf_data_repo` | `null` (di `train_config.yml`: `rijalulfikri/utluma-zipformer-data`) | repo dataset HF (private) berisi shard tar `data_dir`; jika diisi, `--stage prepare` mengunduh, memverifikasi sha256, dan mengekstraknya, dan baru memakai `rclone sync` jika gagal |
+| `rclone_remote_path` | `utluma:RClone/Utluma/zipformer-data` | sumber data untuk `--stage prepare` (`rclone sync` ke `data_dir`) jika `hf_data_repo` kosong atau gagal |
 | `data_dir` | `./data-zipformer` | lokasi data lokal di box |
 | `rclone_checkpoint_path` | `null` (di `train_config.yml`: `utluma:RClone/Utluma/zipformer-data/checkpoints/utluma-zipformer-ctc-v0`) | backup checkpoint ke Drive; `null` menonaktifkan backup |
 
-**Waktu sinkronisasi data.** Dataset berisi ~250–300 ribu file FLAC kecil, dan Google Drive membatasi jumlah request per detik, sehingga `rclone sync` pertama bisa memakan waktu berjam-jam, bukan 30–60 menit. Ukur waktu sync untuk satu moshaf saat smoke run (Task 12) sebelum memutuskan layout data ini; perkiraan waktu "setup" di bagian [Jika box Vast.ai mati di tengah training](#jika-box-vastai-mati-di-tengah-training) bergantung pada hasil pengukuran tersebut.
+**Waktu unduh data.** Dataset berisi ~306 ribu file FLAC kecil (~65 GiB). Google Drive membatasi jumlah request per detik, sehingga `rclone sync` butuh ±2 jam di box Vast.ai. Karena itu `data_dir` yang sudah jadi juga disimpan sebagai 17 shard tar (±4 GiB) di repo dataset HF private `hf_data_repo`, yang terunduh jauh lebih cepat: semua shard (65 GiB) terunduh dan terverifikasi dalam ±4,5 menit (±250 MiB/s) di box RTX 5090 Vast.ai. Hasil ekstraksinya identik byte demi byte dengan data di Drive, jadi resume checkpoint tetap tepat.
+
+Shard dibuat sekali dari box yang sudah punya data lengkap (perlu `HUGGINGFACE_TOKEN` dengan izin tulis). Jalankan ulang setiap kali data di Drive berubah, karena shard HF tidak ikut berubah sendiri:
+
+```bash
+cd zipformer && set -a && . ./.env && set +a
+.venv-zipformer/bin/python vastai/pack_data_to_hf.py --data-dir data-zipformer --repo rijalulfikri/utluma-zipformer-data
+```
 
 ## 3. Jalankan di Vast.ai
 
@@ -107,7 +115,7 @@ Argumen tambahan diteruskan ke `train_zipformer.py`, mis. `bash train_zipformer.
 
 Stage:
 
-* `prepare`: `rclone sync <rclone_remote_path> <data_dir> --progress --transfers 32 --checkers 32 --fast-list --drive-pacer-min-sleep 10ms --drive-pacer-burst 200`. Gagal dengan pesan jelas jika `rclone` tidak ada atau belum ada remote (`rclone listremotes` kosong).
+* `prepare`: jika `hf_data_repo` diisi, unduh shard tar dari HF (4 paralel), cek sha256 terhadap `index.json`, ekstrak ke `data_dir`; shard yang sudah selesai dilewati saat dijalankan ulang. Jika gagal (atau `hf_data_repo` kosong): `rclone sync <rclone_remote_path> <data_dir> --progress --transfers 32 --checkers 32 --fast-list --drive-pacer-min-sleep 10ms --drive-pacer-burst 200 --exclude "/checkpoints/**"`. Gagal dengan pesan jelas jika `rclone` tidak ada atau belum ada remote (`rclone listremotes` kosong).
 * `train`: training dengan resume otomatis dari checkpoint lokal atau Drive (mana yang lebih baru), lalu merata-ratakan `avg_last_k` epoch terakhir menjadi `averaged-<k>.pt`. Jika `rclone lsjson` ke Drive gagal, muncul warning dan training lanjut dengan checkpoint lokal saja.
 * `eval`: PER test set (`per_phonemes`) dengan `export_chunk_size` / `export_left_context` → `test_results.json` (dilewati jika sudah ada, kecuali `--rerun-testset`).
 * `export`: ONNX streaming fp32 + int8 ke `export/`, cek bahwa decode ONNX cocok dengan PyTorch pada 5 cut test (kesesuaian argmax per frame ≥ 99 % dan PER token ONNX vs PyTorch ≤ 1 %; keduanya dicatat di log), lalu qdat_bench dengan model ONNX fp32.
@@ -143,7 +151,7 @@ scp -P <PORT> -r root@<IP_VAST_AI>:~/prepare-quran-dataset/zipformer/results-zip
 bash train_zipformer.sh
 ```
 
-Perintah ini sekaligus perintah restart: data disinkronkan ulang dari Drive, checkpoint terbaru diunduh dari `rclone_checkpoint_path`, dan training lanjut dari batch tersebut. Sebelum training, log menampilkan satu baris seperti:
+Perintah ini sekaligus perintah restart: data diunduh ulang (shard HF, atau Drive sebagai cadangan), checkpoint terbaru diunduh dari `rclone_checkpoint_path`, dan training lanjut dari batch tersebut. Sebelum training, log menampilkan satu baris seperti:
 
 ```
 resume: source=drive checkpoint=checkpoint-48000.pt epoch=5 batch_idx_train=48000 age=0h 23m
