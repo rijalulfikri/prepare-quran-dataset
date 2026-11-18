@@ -85,6 +85,6 @@ max_dropped_fraction: 0.01     # abort train if more speech cuts fail the CTC fr
 
 # ---- fault tolerance ----
 save_every_n_batches: 2000
-rclone_checkpoint_path: "utluma:RClone/Utluma/zipformer-data/checkpoints/utluma-zipformer-ctc-v0"  # null disables Drive backup
+rclone_checkpoint_path: "utluma-edit:RClone/Utluma/zipformer-data/checkpoints/utluma-zipformer-ctc-v0"  # null disables Drive backup
 upload_timeout_seconds: 1800
 shutdown_flush_seconds: 120
