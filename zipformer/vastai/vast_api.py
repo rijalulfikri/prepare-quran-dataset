@@ -4,7 +4,8 @@ Vast.ai API Library
 Provides core functionality for interacting with Vast.ai API.
 
 Environment Variables:
-    VAST_API_KEY  - Vast.ai API key (required for all operations)
+    VAST_API_KEY  - Vast.ai API key (required for all operations; falls back to
+                    the key file written by ``vastai set api-key``)
     VAST_LABEL    - Instance label filter used by get_instance_ids_by_label()
 """
 import json
@@ -14,7 +15,7 @@ import traceback
 
 import requests
 import vast
-from vast import APIKEY_FILE  # noqa: F401 – re-exported for callers that need it
+from vast import APIKEY_FILE  # also re-exported for callers that need it
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -65,12 +66,28 @@ def get_env_variable(var_name: str, *, required: bool = True, default=None) -> s
 
 
 def get_api_key() -> str:
-    """Return the Vast.ai API key from the ``VAST_API_KEY`` environment variable.
+    """Return the Vast.ai API key.
+
+    Reads the ``VAST_API_KEY`` environment variable, falling back to the key
+    file written by ``vastai set api-key`` (:data:`vast.APIKEY_FILE`).
 
     Raises:
-        ValueError: If ``VAST_API_KEY`` is not set or empty.
+        ValueError: If neither source provides a key.
     """
-    return get_env_variable("VAST_API_KEY", required=True)
+    api_key = get_env_variable("VAST_API_KEY", required=False)
+    if api_key:
+        return api_key
+
+    if os.path.isfile(APIKEY_FILE):
+        with open(APIKEY_FILE, encoding="utf-8") as f:
+            api_key = f.read().strip()
+        if api_key:
+            return api_key
+
+    raise ValueError(
+        f"Vast.ai API key not found in VAST_API_KEY or {APIKEY_FILE}. "
+        "Set it using: export VAST_API_KEY='your-value' or vastai set api-key 'your-value'"
+    )
 
 
 # ---------------------------------------------------------------------------
