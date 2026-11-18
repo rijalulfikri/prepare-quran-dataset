@@ -101,14 +101,19 @@ def check_rclone() -> None:
 
 
 def stage_prepare(cfg, args: argparse.Namespace) -> None:
-    if cfg.hf_data_repo:
-        from quran_zipformer.hf_data import fetch_hf_shards
+    from quran_zipformer import data_shards
 
+    # Tar shards (Hugging Face, then Drive) are far faster than ~300 k small files;
+    # each source holds the same bytes, so a failure just moves to the next one
+    sources = data_shards.shard_sources(cfg)
+    for source in sources:
         try:
-            fetch_hf_shards(cfg.hf_data_repo, Path(cfg.data_dir))
+            data_shards.fetch_shards(source, Path(cfg.data_dir))
             return
-        except Exception as exc:  # noqa: BLE001 - Drive still has the same data
-            log.warning("fetching data from %s failed (%s); falling back to rclone sync", cfg.hf_data_repo, exc)
+        except Exception as exc:  # noqa: BLE001 - the next source has the same data
+            log.warning("fetching data shards from %s failed (%s); trying the next source", source.name, exc)
+    if sources:
+        log.warning("no data shard source succeeded; falling back to rclone sync of the raw files (slow)")
     check_rclone()
     log.info("syncing %s -> %s", cfg.rclone_remote_path, cfg.data_dir)
     # ~250-300 k small FLAC files and a request-rate-limited Drive API: many

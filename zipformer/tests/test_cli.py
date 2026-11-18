@@ -17,17 +17,17 @@ def test_defaults():
 
 
 @pytest.fixture
-def hf_unavailable(monkeypatch):
-    """The real config sets hf_data_repo; make the HF fetch fail without network."""
-    from quran_zipformer import hf_data
+def shards_unavailable(monkeypatch):
+    """The real config sets shard sources; make every shard fetch fail without network."""
+    from quran_zipformer import data_shards
 
     def fail(*args, **kwargs):
         raise OSError("no network in tests")
 
-    monkeypatch.setattr(hf_data, "fetch_hf_shards", fail)
+    monkeypatch.setattr(data_shards, "fetch_shards", fail)
 
 
-def test_prepare_without_rclone_fails_with_message(monkeypatch, capsys, hf_unavailable):
+def test_prepare_without_rclone_fails_with_message(monkeypatch, capsys, shards_unavailable):
     monkeypatch.setattr(tz.shutil, "which", lambda name: None)
 
     def no_subprocess(*args, **kwargs):
@@ -39,7 +39,7 @@ def test_prepare_without_rclone_fails_with_message(monkeypatch, capsys, hf_unava
     assert "rclone" in capsys.readouterr().err
 
 
-def test_prepare_without_remote_fails(monkeypatch, capsys, hf_unavailable):
+def test_prepare_without_remote_fails(monkeypatch, capsys, shards_unavailable):
     monkeypatch.setattr(tz.shutil, "which", lambda name: "/usr/bin/rclone")
     calls = []
 
@@ -99,7 +99,9 @@ def test_prepare_syncs_with_drive_tuned_flags(monkeypatch):
     monkeypatch.setattr(tz, "check_rclone", lambda: None)
     calls = []
     monkeypatch.setattr(tz.subprocess, "run", lambda cmd, **kwargs: calls.append(cmd))
-    cfg = types.SimpleNamespace(rclone_remote_path="gdrive:data", data_dir="data-zipformer", hf_data_repo=None)
+    cfg = types.SimpleNamespace(
+        rclone_remote_path="gdrive:data", data_dir="data-zipformer", hf_data_repo=None, drive_data_shards_path=None
+    )
     tz.stage_prepare(cfg, tz.parse_args([]))
     assert calls == [RCLONE_SYNC]
 
@@ -112,30 +114,44 @@ RCLONE_SYNC = [
 ]
 
 
-def _prepare_with_hf(monkeypatch, fetch):
-    from quran_zipformer import hf_data
+def _prepare_with_shards(monkeypatch, failing_sources=()):
+    """Run stage_prepare with HF + Drive shard sources; names in `failing_sources` raise."""
+    from quran_zipformer import data_shards
 
     monkeypatch.setattr(tz, "check_rclone", lambda: None)
-    calls = []
+    calls, tried = [], []
     monkeypatch.setattr(tz.subprocess, "run", lambda cmd, **kwargs: calls.append(cmd))
-    monkeypatch.setattr(hf_data, "fetch_hf_shards", fetch)
-    cfg = types.SimpleNamespace(rclone_remote_path="gdrive:data", data_dir="data-zipformer", hf_data_repo="u/data")
+
+    def fetch(source, data_dir):
+        tried.append(source.name)
+        if source.name in failing_sources:
+            raise OSError(f"{source.name} down")
+
+    monkeypatch.setattr(data_shards, "fetch_shards", fetch)
+    cfg = types.SimpleNamespace(
+        rclone_remote_path="gdrive:data", data_dir="data-zipformer",
+        hf_data_repo="u/data", drive_data_shards_path="gdrive:shards",
+    )
     tz.stage_prepare(cfg, tz.parse_args([]))
-    return calls
+    return tried, calls
 
 
-def test_prepare_uses_hf_shards_without_rclone(monkeypatch):
-    fetched = []
-    calls = _prepare_with_hf(monkeypatch, lambda repo, data_dir: fetched.append((repo, str(data_dir))))
-    assert fetched == [("u/data", "data-zipformer")]
+def test_prepare_uses_hf_shards_first(monkeypatch):
+    tried, calls = _prepare_with_shards(monkeypatch)
+    assert tried == ["hf:u/data"]
     assert calls == []
 
 
-def test_prepare_falls_back_to_rclone_when_hf_fails(monkeypatch, caplog):
-    def fail(repo, data_dir):
-        raise OSError("hub down")
+def test_prepare_falls_back_to_drive_shards_when_hf_fails(monkeypatch, caplog):
+    tried, calls = _prepare_with_shards(monkeypatch, failing_sources={"hf:u/data"})
+    assert tried == ["hf:u/data", "gdrive:shards"]
+    assert calls == []
+    assert "trying the next source" in caplog.text
 
-    calls = _prepare_with_hf(monkeypatch, fail)
+
+def test_prepare_falls_back_to_rclone_sync_when_all_shards_fail(monkeypatch, caplog):
+    tried, calls = _prepare_with_shards(monkeypatch, failing_sources={"hf:u/data", "gdrive:shards"})
+    assert tried == ["hf:u/data", "gdrive:shards"]
     assert calls == [RCLONE_SYNC]
     assert "falling back to rclone sync" in caplog.text
 
