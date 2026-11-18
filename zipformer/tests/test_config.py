@@ -10,7 +10,7 @@ YAML = Path(__file__).resolve().parents[1] / "configs" / "train_config.yml"
 def test_default_yaml_loads_and_matches_v3_dims():
     c = ZipformerTrainConfig.from_yaml(YAML)
     assert c.encoder_dim == "192,256,384,512,384,256"
-    assert c.chunk_size == "8,16,24" and c.left_context_frames == "64,128,256"
+    assert c.chunk_size == "8,16,24" and c.left_context_frames == "72,128,256"
     assert c.test_moshaf_ids == ["19.0", "29.0", "30.0"]
     assert len(c.train_moshaf_ids) == 23
 
@@ -33,6 +33,17 @@ def test_tiny_two_stack_config_is_valid():
     assert c.export_chunk_size == 8
 
 
+def test_left_context_must_cover_conv_kernel_for_every_chunk():
+    # icefall Zipformer2._get_attn_mask asserts
+    # chunk * (left // chunk) >= (kernel // 2) * downsampling for every stack;
+    # with the default dims that is 56, and 24 * (64 // 24) = 48 fails
+    with pytest.raises(ValueError, match="left_context_frames"):
+        ZipformerTrainConfig(
+            train_moshaf_ids=["0.0"], test_moshaf_ids=[],
+            chunk_size="8,16,24", left_context_frames="64,128,256",
+        )
+
+
 def test_avg_last_k_must_not_exceed_keep_last_k():
     with pytest.raises(ValueError):
         ZipformerTrainConfig(
@@ -50,7 +61,7 @@ def test_roundtrip(tmp_path):
 def test_fault_tolerance_defaults():
     c = ZipformerTrainConfig.from_yaml(YAML)
     assert c.save_every_n_batches == 2000 and c.keep_last_k == 3
-    assert c.rclone_checkpoint_path.startswith("utluma:")
+    assert c.rclone_checkpoint_path.startswith("utluma-edit:")
     default = ZipformerTrainConfig(train_moshaf_ids=["0.0"], test_moshaf_ids=[])
     assert default.rclone_checkpoint_path is None
 

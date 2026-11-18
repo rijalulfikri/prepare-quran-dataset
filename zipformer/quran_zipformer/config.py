@@ -35,7 +35,7 @@ class ZipformerTrainConfig(BaseModel):
     output_downsampling_factor: Literal[1, 2] = 1
     causal: bool = True
     chunk_size: str = "8,16,24"
-    left_context_frames: str = "64,128,256"
+    left_context_frames: str = "72,128,256"
     feature_dim: int = 80
 
     # --- training ---
@@ -83,6 +83,8 @@ class ZipformerTrainConfig(BaseModel):
                 f"export_chunk_size ({self.export_chunk_size}) must be one of "
                 f"chunk_size values {chunk_sizes}"
             )
+        if self.causal:
+            self._validate_chunk_context(chunk_sizes)
         if self.save_every_n_batches < 1:
             raise ValueError("save_every_n_batches must be >= 1")
         if self.rclone_checkpoint_path is not None and ":" not in self.rclone_checkpoint_path:
@@ -91,6 +93,28 @@ class ZipformerTrainConfig(BaseModel):
                 f"got {self.rclone_checkpoint_path!r}"
             )
         return self
+
+    def _validate_chunk_context(self, chunk_sizes: list[int]) -> None:
+        """Reject chunk / left-context pairs icefall's Zipformer2 asserts on.
+
+        Training samples `chunk_size` and `left_context_frames` independently and
+        uses `left // chunk` whole chunks of context; `_get_attn_mask` requires
+        `chunk * (left // chunk) >= (kernel // 2) * downsampling` for every stack,
+        so a bad pair otherwise only fails on the GPU when it is first drawn.
+        """
+        kernels = [int(x) for x in self.cnn_module_kernel.split(",")]
+        factors = [int(x) for x in self.downsampling_factor.split(",")]
+        need = max(k // 2 * d for k, d in zip(kernels, factors))
+        lefts = [int(x) for x in self.left_context_frames.split(",")]
+        pairs = {(c, left) for c in chunk_sizes for left in lefts if c > 0 and left >= 0}
+        pairs.add((self.export_chunk_size, self.export_left_context))
+        bad = sorted((c, left) for c, left in pairs if c * (left // c) < need)
+        if bad:
+            raise ValueError(
+                f"chunk_size / left_context_frames pairs {bad} give fewer than {need} frames "
+                "of left context (chunk * (left // chunk)), which icefall's Zipformer2 "
+                "requires for cnn_module_kernel / downsampling_factor"
+            )
 
     @classmethod
     def from_yaml(cls, yaml_path: str | Path) -> "ZipformerTrainConfig":

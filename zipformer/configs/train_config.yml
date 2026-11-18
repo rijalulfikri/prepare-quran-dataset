@@ -53,7 +53,7 @@ cnn_module_kernel: "31,31,15,15,15,31"
 output_downsampling_factor: 1  # 20 ms frames; deliberately differs from v3 (40 ms) for CTC blank headroom
 causal: true
 chunk_size: "8,16,24"          # chunk sizes sampled during training
-left_context_frames: "64,128,256"
+left_context_frames: "72,128,256"  # every chunk * (left // chunk) must be >= 56 (icefall assert)
 feature_dim: 80                # fbank bins
 
 # ---- training ----
