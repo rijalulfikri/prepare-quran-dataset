@@ -11,7 +11,7 @@ Satu skrip dari komputer lokal untuk menjalankan langkah 3 README Zipformer
 3. Clone repo ini di box (atau fetch + checkout branch jika sudah ada).
 4. Kirim ~/.config/rclone/rclone.conf ke box.
 5. Kirim zipformer/.env ke box (WANDB_API_KEY, HUGGINGFACE_TOKEN, K2_WHEEL_URL,
-   K2_WHEEL_URL_CP312).
+   K2_WHEEL_URL_CP312), dan file config lokal jika --config diisi.
 6. Jalankan `bash train_zipformer.sh` di sesi tmux `zipformer`, dengan log di
    ~/train_zipformer.log, sehingga training tetap berjalan walau SSH putus.
 
@@ -23,6 +23,13 @@ instance dibiarkan hidup.
 
 Skrip ini aman dijalankan ulang, termasuk di box baru setelah box lama mati:
 train_zipformer.sh melanjutkan dari checkpoint terbaru di Google Drive.
+
+Dengan --config <file lokal>, file itu dikirim ke box (di luar folder repo) dan
+dipakai oleh train_zipformer.sh dan upload_results_and_destroy.sh lewat
+CONFIG_FILE, menggantikan configs/train_config.yml dari GitHub. Saat menjalankan
+ulang (mis. setelah box mati), berikan --config yang sama lagi; tanpa --config
+box memakai config dari repo. output_dir dan rclone_checkpoint_path menentukan
+checkpoint mana yang dilanjutkan: nama run baru berarti training dari nol.
 
 Box ditentukan dengan salah satu cara:
 - --offer-id: buat instance baru dari offer tersebut (image --image, disk --disk,
@@ -45,6 +52,7 @@ Contoh:
     python zipformer/vastai/run_zipformer_training.py --host 45.81.32.13 --follow
     python zipformer/vastai/run_zipformer_training.py --host 45.81.32.13 --port 23330 --follow
     python zipformer/vastai/run_zipformer_training.py --label zipformer --auto-restart --destroy-when-done
+    python zipformer/vastai/run_zipformer_training.py --config zipformer/configs/train_config.yml --follow
     python zipformer/vastai/run_zipformer_training.py --host ... --port ... -- --push-to-hub
 
 Prasyarat:
@@ -73,6 +81,10 @@ REMOTE_DONE_MARKER = "/root/.train_zipformer.done"
 TMUX_SESSION = "zipformer"
 FINISH_SCRIPT = "upload_results_and_destroy.sh"
 REMOTE_FINISH_SCRIPT = f"/root/{FINISH_SCRIPT}"
+# --config: di luar checkout supaya tidak bentrok dengan `git pull` di box
+REMOTE_CONFIG = "/root/zipformer_train_config.yml"
+# Field yang menentukan run mana yang dilanjutkan (lihat check_local_config)
+RUN_IDENTITY_FIELDS = ("output_dir", "rclone_checkpoint_path", "wandb_project_name", "hub_model_id")
 K2_VARS = ("K2_WHEEL_URL", "K2_WHEEL_URL_CP312")
 DEFAULT_TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu128"  # sama dengan train_zipformer.sh
 
@@ -116,6 +128,30 @@ def read_env_keys(env_path):
             key = key.removeprefix("export ").strip()
             values[key] = value.strip().strip("'\"")
     return values
+
+
+def check_local_config(config_path):
+    """Pastikan --config ada dan YAML valid, lalu cetak field yang menentukan run mana yang dilanjutkan."""
+    if not os.path.isfile(config_path):
+        print(f"Error: --config {config_path} tidak ditemukan.")
+        sys.exit(1)
+    try:
+        import yaml
+    except ImportError:
+        print(f"PERINGATAN: paket PyYAML tidak ada di lokal; {config_path} tidak divalidasi sebelum dikirim.")
+        return
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+    except yaml.YAMLError as exc:
+        print(f"Error: {config_path} bukan YAML yang valid:\n{exc}")
+        sys.exit(1)
+    if not isinstance(cfg, dict):
+        print(f"Error: {config_path} tidak berisi mapping YAML.")
+        sys.exit(1)
+    print(f"Config lokal {config_path} akan dipakai di box:")
+    for key in RUN_IDENTITY_FIELDS:
+        print(f"  {key}: {cfg.get(key)}")
 
 
 def resolve_box(args):
@@ -222,7 +258,9 @@ def wait_for_ssh(ssh, timeout=SSH_READY_TIMEOUT, interval=15):
 
 
 def check_local_prerequisites(args):
-    """Validasi rclone.conf, .env, K2_WHEEL_URL, dan commit yang akan di-clone box."""
+    """Validasi rclone.conf, .env, K2_WHEEL_URL, --config, dan commit yang akan di-clone box."""
+    if args.config:
+        check_local_config(args.config)
     if not os.path.isfile(args.rclone_conf):
         print(f"Error: {args.rclone_conf} tidak ditemukan. Konfigurasi rclone dulu (README bagian 2).")
         sys.exit(1)
@@ -276,6 +314,9 @@ def check_local_prerequisites(args):
 def build_train_command(args):
     """Command bash yang dijalankan di dalam sesi tmux: training (+ upload & destroy)."""
     exports = [f"export {k}={shlex.quote(os.environ[k])}" for k in K2_VARS if os.getenv(k)]
+    if args.config:
+        # Dibaca train_zipformer.sh dan upload_results_and_destroy.sh (shell yang sama)
+        exports.append(f"export CONFIG_FILE={REMOTE_CONFIG}")
     if args.auto_restart:
         exports.append("export AUTO_RESTART=1")
     train_cmd = shlex.join(["bash", "train_zipformer.sh", *args.train_args])
@@ -340,6 +381,9 @@ def main():
     parser.add_argument("--branch", default="main", help="branch yang di-clone di box (default: main)")
     parser.add_argument("--env-file", default=os.path.join(ZIPFORMER_DIR, ".env"))
     parser.add_argument("--rclone-conf", default=os.path.expanduser("~/.config/rclone/rclone.conf"))
+    parser.add_argument("--config",
+                        help="file config training lokal yang dikirim ke box dan dipakai menggantikan "
+                             "configs/train_config.yml dari GitHub (default: config di repo)")
     parser.add_argument("--auto-restart", action="store_true",
                         help="set AUTO_RESTART=1 (ulangi training maks 3x jika crash)")
     parser.add_argument("--destroy-when-done", action="store_true",
@@ -408,11 +452,14 @@ def launch_training(args, host, port, wait_ssh=False):
     run_command(scp + [args.rclone_conf, f"root@{host}:/root/.config/rclone/rclone.conf"], dry)
     run_command(ssh + ["chmod 600 /root/.config/rclone/rclone.conf"], dry)
 
-    print("\n[5/6] Kirim .env" + (f" dan {FINISH_SCRIPT}" if args.destroy_when_done else ""))
+    extras = [f"config {args.config}" if args.config else None, FINISH_SCRIPT if args.destroy_when_done else None]
+    print("\n[5/6] Kirim .env" + "".join(f", {e}" for e in extras if e))
     if os.path.isfile(args.env_file):
         run_command(scp + [args.env_file, f"root@{host}:{REMOTE_REPO_DIR}/zipformer/.env"], dry)
     else:
         print("Dilewati (.env lokal tidak ada).")
+    if args.config:
+        run_command(scp + [args.config, f"root@{host}:{REMOTE_CONFIG}"], dry)
     if args.destroy_when_done:
         # Dikirim dari lokal (bukan dari clone) supaya tidak bergantung pada commit yang sudah di-push
         run_command(scp + [os.path.join(SCRIPT_DIR, FINISH_SCRIPT), f"root@{host}:{REMOTE_FINISH_SCRIPT}"], dry)
