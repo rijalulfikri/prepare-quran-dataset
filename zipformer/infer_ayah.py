@@ -17,6 +17,14 @@ dataset file name like `002.0255.flac` is `<surah>.<segment>`, not always an
 ayah number; for such files pass the cut's label with `--reference`. Works with
 `epoch-*.pt`, `checkpoint-*.pt` and `averaged-*.pt` (all store `model` and
 `config`).
+
+A streaming `.onnx` / `.ort` checkpoint (this repo's export, or utluma_app's
+utluma3) is decoded with sherpa-onnx instead, fed like the app's MesinSherpa;
+it needs only sherpa-onnx, lhotse and the reference tools, not icefall:
+
+    python infer_ayah.py --audio ayah.flac --sura 1 --aya 7 \\
+        --checkpoint .../utluma_cek_tilawah/model/zipformer_p_arabic_v3_c16_utluma3.int8.ort \\
+        --tokens .../utluma_cek_tilawah/assets/model/tokens.txt
 """
 
 from __future__ import annotations
@@ -36,7 +44,10 @@ sys.path.insert(0, str(ZIPFORMER_DIR.parent / "src"))
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--checkpoint", required=True, help="epoch-N.pt / checkpoint-N.pt / averaged-K.pt")
+    p.add_argument("--checkpoint", required=True,
+                   help="epoch-N.pt / checkpoint-N.pt / averaged-K.pt, or a streaming .onnx / .ort "
+                        "(e.g. utluma_app's utluma3), decoded with sherpa-onnx")
+    p.add_argument("--tokens", help="tokens.txt for an .onnx/.ort checkpoint (default: next to the model)")
     p.add_argument("--audio", required=True, help="audio file (any rate/channels; resampled to 16 kHz mono)")
     p.add_argument("--sura", type=int, help="surah number, for the reference phonemes and PER")
     p.add_argument("--aya", type=int, help="ayah number, for the reference phonemes and PER")
@@ -118,31 +129,87 @@ def transcribe(model, cfg, tokens, feats: torch.Tensor, chunk_size: int, left_co
     return tokens.decode(ids), [(tokens.decode([tok]), t) for tok, t in times]
 
 
+def load_wav_16k(audio: Path):
+    """Float32 mono 16 kHz samples of any audio file."""
+    from lhotse import Recording
+
+    rec = Recording.from_file(str(audio))
+    if rec.sampling_rate != 16000:
+        rec = rec.resample(16000)
+    return rec.load_audio().mean(axis=0)
+
+
+def transcribe_sherpa(model: Path, tokens: Path, wav, num_threads: int = 2):
+    """`(phonemes, [(unit, start_seconds), ...])` from a sherpa-onnx zipformer2 CTC model.
+
+    Fed like utluma_app's MesinSherpa: 100 ms blocks, then 660 ms of zeros and
+    `input_finished`, greedy, no endpointing.
+    """
+    import numpy as np
+    import sherpa_onnx
+
+    rec = sherpa_onnx.OnlineRecognizer.from_zipformer2_ctc(
+        tokens=str(tokens), model=str(model), num_threads=num_threads,
+        sample_rate=16000, feature_dim=80, decoding_method="greedy_search",
+        enable_endpoint_detection=False,
+    )
+    stream = rec.create_stream()
+    for i in range(0, len(wav), 1600):
+        stream.accept_waveform(16000, wav[i : i + 1600])
+        while rec.is_ready(stream):
+            rec.decode_stream(stream)
+    stream.accept_waveform(16000, np.zeros(int(0.66 * 16000), np.float32))
+    stream.input_finished()
+    while rec.is_ready(stream):
+        rec.decode_stream(stream)
+    result = rec.get_result_all(stream)
+    return result.text, list(zip(result.tokens, result.timestamps))
+
+
+def phoneme_error_rate(hyp: str, ref: str) -> float:
+    """Character-level PER, capped at the reference length like `decode.per`.
+
+    One phoneme is one character in quran-transcript's script, so this equals
+    `decode.per` for this repo's vocab and also works for models with
+    multi-character units (utluma3).
+    """
+    import Levenshtein
+
+    return min(Levenshtein.distance(hyp, ref), len(ref)) / len(ref) if ref else 0.0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    if args.icefall_root:
-        os.environ["ICEFALL_ROOT"] = args.icefall_root  # read by quran_zipformer.icefall_import
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    model, cfg, tokens = load_model(Path(args.checkpoint), device)
-    chunk = args.chunk_size or cfg.export_chunk_size
-    left = args.left_context if args.left_context is not None else cfg.export_left_context
-
-    feats = fbank(Path(args.audio), cfg.feature_dim)
-    hyp, times = transcribe(model, cfg, tokens, feats, chunk, left, device)
+    checkpoint = Path(args.checkpoint)
+    if checkpoint.suffix in (".onnx", ".ort"):
+        tokens_txt = Path(args.tokens) if args.tokens else checkpoint.parent / "tokens.txt"
+        wav = load_wav_16k(Path(args.audio))
+        hyp, times = transcribe_sherpa(checkpoint, tokens_txt, wav)
+        duration = len(wav) / 16000
+        mode = f"sherpa-onnx (chunking baked into the model), tokens {tokens_txt}"
+    else:
+        if args.icefall_root:
+            os.environ["ICEFALL_ROOT"] = args.icefall_root  # read by quran_zipformer.icefall_import
+        device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        model, cfg, tokens = load_model(checkpoint, device)
+        chunk = args.chunk_size or cfg.export_chunk_size
+        left = args.left_context if args.left_context is not None else cfg.export_left_context
+        feats = fbank(Path(args.audio), cfg.feature_dim)
+        hyp, times = transcribe(model, cfg, tokens, feats, chunk, left, device)
+        duration = feats.shape[1] / 100
+        mode = f"chunk={chunk} left_context={left} frames"
 
     print(f"checkpoint : {args.checkpoint}")
-    print(f"audio      : {args.audio} ({feats.shape[1] / 100:.2f} s)")
-    print(f"streaming  : chunk={chunk} left_context={left} frames")
+    print(f"audio      : {args.audio} ({duration:.2f} s)")
+    print(f"streaming  : {mode}")
     print(f"hypothesis : {hyp}")
     ref = args.reference
     if ref is None and args.sura is not None and args.aya is not None:
         uthmani, ref = reference_phonemes(args.sura, args.aya, args)
         print(f"ayah       : {args.sura}:{args.aya} {uthmani}")
     if ref is not None:
-        from quran_zipformer.decode import per
-
         print(f"reference  : {ref}")
-        print(f"PER        : {per([tokens.encode(hyp)], [tokens.encode(ref)]):.2%}")
+        print(f"PER        : {phoneme_error_rate(hyp, ref):.2%}")
     if args.times:
         for ph, t in times:
             print(f"  {t:6.2f}s  {ph}")
