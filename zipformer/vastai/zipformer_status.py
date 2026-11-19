@@ -305,7 +305,11 @@ def print_status(args, st):
         print(f"\nKecepatan: {hours * 60:.0f} menit/epoch (rata-rata 3 epoch terakhir); epoch {last}/{num_epochs}")
     if st["state"] == "TRAINING" and table:
         stop_at = last + st["patience"] - st["since"]
-        print(f"Early stop paling cepat setelah epoch {stop_at} (jika tidak ada rekor baru)")
+        # watchdog hanya memicu sebelum epoch terakhir
+        if stop_at < num_epochs:
+            print(f"Early stop paling cepat setelah epoch {stop_at} (jika tidak ada rekor baru)")
+        else:
+            print(f"Early stop tidak mungkin lagi; training berjalan sampai epoch {num_epochs}")
     credit = vast_credit()
     if credit:
         c, burn = credit
