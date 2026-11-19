@@ -1,13 +1,19 @@
 """Live phoneme transcription from the microphone with a streaming Zipformer2-CTC ONNX.
 
-Uses sherpa-onnx's OnlineRecognizer on a model exported by `export_streaming_onnx`
-(`train_zipformer.py --stage export`, or `results-zipformer-v0/export*/`). The
-hypothesis updates as you recite; after a pause (endpoint) the line is finished
-and a new one starts. Ctrl+C stops.
+Uses sherpa-onnx's OnlineRecognizer, the same engine as utluma_app's MesinSherpa,
+so it runs any sherpa zipformer2 CTC model: this repo's export
+(`export_streaming_onnx`, `results-zipformer-v0/export*/`) or the app's utluma3
+`.ort` with its own tokens.txt. Both emit quran-transcript phonemes (utluma3 in
+multi-character units), so the joined text and the PER are comparable. The
+hypothesis updates as you recite; after a pause the line is finished and a new
+one starts. Ctrl+C stops.
 
     python live_transcribe.py --model-dir results-zipformer-v0/export-epoch-18
     python live_transcribe.py --model-dir ... --sura 1 --aya 6   # PER per line
     python live_transcribe.py --model-dir ... --wav ayah.flac    # file, in real time
+    python live_transcribe.py \\
+        --model .../utluma_cek_tilawah/model/zipformer_p_arabic_v3_c16_utluma3.int8.ort \\
+        --tokens .../utluma_cek_tilawah/assets/model/tokens.txt
 
 Needs sherpa-onnx and sounddevice (mic) or soundfile (--wav); macOS asks for
 microphone permission for the terminal app on first use.
@@ -28,8 +34,11 @@ BLOCK_S = 0.1  # audio fed to the recognizer per step
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--model-dir", required=True, help="folder with model(.int8).onnx and tokens.txt")
-    p.add_argument("--fp32", action="store_true", help="use model.onnx instead of model.int8.onnx")
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--model-dir", help="folder with model(.int8).onnx and tokens.txt (this repo's export)")
+    src.add_argument("--model", help="any streaming zipformer2 CTC model file (.onnx or .ort), e.g. utluma3")
+    p.add_argument("--tokens", help="tokens.txt for --model (default: next to the model)")
+    p.add_argument("--fp32", action="store_true", help="with --model-dir: model.onnx instead of model.int8.onnx")
     p.add_argument("--num-threads", type=int, default=2)
     p.add_argument("--device", help="input device index or name (default: system mic); see --list-devices")
     p.add_argument("--list-devices", action="store_true", help="list audio devices and exit")
@@ -44,13 +53,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def model_files(args: argparse.Namespace) -> tuple[Path, Path]:
+    """`(model, tokens)` from --model/--tokens, falling back to --model-dir."""
+    if args.model:
+        model = Path(args.model)
+    else:
+        model = Path(args.model_dir) / ("model.onnx" if args.fp32 else "model.int8.onnx")
+    tokens = Path(args.tokens) if args.tokens else model.parent / "tokens.txt"
+    for f in (model, tokens):
+        if not f.is_file():
+            raise SystemExit(f"not found: {f}")
+    return model, tokens
+
+
 def make_recognizer(args: argparse.Namespace):
     import sherpa_onnx
 
-    d = Path(args.model_dir)
-    model = d / ("model.onnx" if args.fp32 else "model.int8.onnx")
+    model, tokens = model_files(args)
+    print(f"model  {model}\ntokens {tokens}")
     return sherpa_onnx.OnlineRecognizer.from_zipformer2_ctc(
-        tokens=str(d / "tokens.txt"),
+        tokens=str(tokens),
         model=str(model),
         num_threads=args.num_threads,
         sample_rate=SAMPLE_RATE,
@@ -177,6 +199,7 @@ def main(argv: list[str] | None = None) -> int:
         nonlocal stream, shown, line_no
         # flush the last chunk: the model needs right-padding to emit its frames
         stream.accept_waveform(SAMPLE_RATE, np.zeros(int(0.8 * SAMPLE_RATE), np.float32))
+        stream.input_finished()
         decode_and_show()
         if shown:
             print(f"   [{score(shown)}]" if score else "")
