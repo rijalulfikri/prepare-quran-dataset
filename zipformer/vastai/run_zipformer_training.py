@@ -21,6 +21,13 @@ menjalankan upload_results_and_destroy.sh: output_dir di-upload ke Drive
 instance Vast.ai dihapus. Jika training gagal/berhenti atau upload gagal,
 instance dibiarkan hidup.
 
+Dengan --early-stop-patience N, zipformer_watchdog.sh berjalan di box (sesi tmux
+`watchdog`): setelah N epoch berturut-turut tanpa rekor dev PER baru (perbaikan
+relatif minimal --early-stop-min-improvement, default 5%), training dihentikan
+rapi, num_epochs di config box diubah ke epoch terakhir, dan pipeline dijalankan
+ulang (averaging 3 epoch terakhir, eval, export; plus upload + destroy jika
+--destroy-when-done).
+
 Skrip ini aman dijalankan ulang, termasuk di box baru setelah box lama mati:
 train_zipformer.sh melanjutkan dari checkpoint terbaru di Google Drive.
 
@@ -48,6 +55,7 @@ Semua cara selain --host + --port butuh VAST_API_KEY dan paket `vastai`.
 
 Contoh:
     python zipformer/vastai/run_zipformer_training.py --destroy-when-done --follow
+    python zipformer/vastai/run_zipformer_training.py --destroy-when-done --early-stop-patience 4
     python zipformer/vastai/run_zipformer_training.py --offer-id 12345678 --destroy-when-done --follow
     python zipformer/vastai/run_zipformer_training.py --host 45.81.32.13 --follow
     python zipformer/vastai/run_zipformer_training.py --host 45.81.32.13 --port 23330 --follow
@@ -68,6 +76,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -85,6 +94,11 @@ REMOTE_FINISH_SCRIPT = f"/root/{FINISH_SCRIPT}"
 REMOTE_CONFIG = "/root/zipformer_train_config.yml"
 # Field yang menentukan run mana yang dilanjutkan (lihat check_local_config)
 RUN_IDENTITY_FIELDS = ("output_dir", "rclone_checkpoint_path", "wandb_project_name", "hub_model_id")
+WATCHDOG_SCRIPT = "zipformer_watchdog.sh"
+REMOTE_WATCHDOG = f"/root/{WATCHDOG_SCRIPT}"
+REMOTE_RELAUNCH = "/root/zipformer_relaunch.sh"
+WATCHDOG_SESSION = "watchdog"
+DEFAULT_EARLY_STOP_MIN_IMPROVEMENT = 0.05
 K2_VARS = ("K2_WHEEL_URL", "K2_WHEEL_URL_CP312")
 DEFAULT_TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu128"  # sama dengan train_zipformer.sh
 
@@ -358,6 +372,25 @@ def build_launch_command(args):
     )
 
 
+def build_watchdog_command(args):
+    """Command bash di box untuk (ulang) menjalankan zipformer_watchdog.sh di sesi tmux sendiri."""
+    env = [
+        f"PATIENCE={args.early_stop_patience}",
+        f"MIN_REL_IMPROVEMENT={args.early_stop_min_improvement}",
+        f"REPO_ZIPFORMER_DIR={REMOTE_REPO_DIR}/zipformer",
+        f"RELAUNCH={REMOTE_RELAUNCH}",
+    ]
+    if args.config:
+        # Watchdog membaca dan mengubah num_epochs di config yang sama dengan pipeline
+        env.append(f"CONFIG_FILE={REMOTE_CONFIG}")
+    env = shlex.join(env)
+    watchdog = f"{env} bash {REMOTE_WATCHDOG}; exec bash"
+    return (
+        f"tmux kill-session -t {WATCHDOG_SESSION} 2>/dev/null; "
+        f"tmux new-session -d -s {WATCHDOG_SESSION} {shlex.quote(watchdog)}"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Jalankan training Zipformer (langkah 3 README) di box Vast.ai dari komputer lokal.",
@@ -391,12 +424,24 @@ def main():
     parser.add_argument("--results-remote",
                         help="tujuan upload hasil untuk --destroy-when-done "
                              "(default: <rclone_checkpoint_path>-results)")
+    parser.add_argument("--early-stop-patience", type=int, metavar="N",
+                        help="jalankan zipformer_watchdog.sh di box: hentikan training setelah N epoch berturut-turut "
+                             "tanpa rekor dev PER baru, lalu selesaikan pipeline (averaging, eval, export, dan "
+                             "upload + destroy jika --destroy-when-done)")
+    parser.add_argument("--early-stop-min-improvement", type=float, default=DEFAULT_EARLY_STOP_MIN_IMPROVEMENT,
+                        metavar="FRAC",
+                        help="perbaikan relatif minimal agar sebuah epoch dihitung rekor baru "
+                             f"(default: {DEFAULT_EARLY_STOP_MIN_IMPROVEMENT})")
     parser.add_argument("--follow", action="store_true",
                         help="tampilkan log training setelah dijalankan (Ctrl+C tidak menghentikan training)")
     parser.add_argument("--dry-run", action="store_true", help="cetak command tanpa menjalankannya")
     parser.add_argument("train_args", nargs="*",
                         help="argumen tambahan untuk train_zipformer.sh, setelah '--' (mis. -- --push-to-hub)")
     args = parser.parse_args()
+    if args.early_stop_patience is not None and args.early_stop_patience < 1:
+        parser.error("--early-stop-patience harus >= 1")
+    if not 0 <= args.early_stop_min_improvement < 1:
+        parser.error("--early-stop-min-improvement harus di antara 0 dan 1")
 
     check_local_prerequisites(args)
     host, port, created_id, from_api = resolve_box(args)
@@ -452,7 +497,12 @@ def launch_training(args, host, port, wait_ssh=False):
     run_command(scp + [args.rclone_conf, f"root@{host}:/root/.config/rclone/rclone.conf"], dry)
     run_command(ssh + ["chmod 600 /root/.config/rclone/rclone.conf"], dry)
 
-    extras = [f"config {args.config}" if args.config else None, FINISH_SCRIPT if args.destroy_when_done else None]
+    early_stop = args.early_stop_patience is not None
+    extras = [
+        f"config {args.config}" if args.config else None,
+        FINISH_SCRIPT if args.destroy_when_done else None,
+        WATCHDOG_SCRIPT if early_stop else None,
+    ]
     print("\n[5/6] Kirim .env" + "".join(f", {e}" for e in extras if e))
     if os.path.isfile(args.env_file):
         run_command(scp + [args.env_file, f"root@{host}:{REMOTE_REPO_DIR}/zipformer/.env"], dry)
@@ -460,17 +510,32 @@ def launch_training(args, host, port, wait_ssh=False):
         print("Dilewati (.env lokal tidak ada).")
     if args.config:
         run_command(scp + [args.config, f"root@{host}:{REMOTE_CONFIG}"], dry)
+    # Skrip box dikirim dari lokal (bukan dari clone) supaya tidak bergantung pada commit yang sudah di-push
     if args.destroy_when_done:
-        # Dikirim dari lokal (bukan dari clone) supaya tidak bergantung pada commit yang sudah di-push
         run_command(scp + [os.path.join(SCRIPT_DIR, FINISH_SCRIPT), f"root@{host}:{REMOTE_FINISH_SCRIPT}"], dry)
+    if early_stop:
+        run_command(scp + [os.path.join(SCRIPT_DIR, WATCHDOG_SCRIPT), f"root@{host}:{REMOTE_WATCHDOG}"], dry)
+        # Watchdog menjalankan ulang pipeline yang persis sama setelah menghentikan training
+        with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as f:
+            f.write(build_launch_command(args) + "\n")
+        try:
+            run_command(scp + [f.name, f"root@{host}:{REMOTE_RELAUNCH}"], dry)
+        finally:
+            os.unlink(f.name)
 
-    print(f"\n[6/6] Jalankan train_zipformer.sh di sesi tmux '{TMUX_SESSION}'")
+    print(f"\n[6/6] Jalankan train_zipformer.sh di sesi tmux '{TMUX_SESSION}'"
+          + (f" dan watchdog di sesi '{WATCHDOG_SESSION}'" if early_stop else ""))
     run_command(ssh + [build_launch_command(args)], dry)
+    if early_stop:
+        run_command(ssh + [build_watchdog_command(args)], dry)
 
     ssh_str = shlex.join(["ssh", "-p", port, "-i", args.identity, f"root@{host}"])
     print("\n--- ✓ Training berjalan di box ---")
     print(f"  Lihat log      : {ssh_str} 'tail -f {REMOTE_LOG}'")
     print(f"  Attach tmux    : {ssh_str} -t 'tmux attach -t {TMUX_SESSION}'")
+    if early_stop:
+        print(f"  Early stop     : {args.early_stop_patience} epoch tanpa perbaikan "
+              f">= {args.early_stop_min_improvement:.0%}; log: {ssh_str} 'tail -f /root/zipformer_watchdog.log'")
     if args.destroy_when_done:
         dest = args.results_remote or "<rclone_checkpoint_path>-results"
         print(f"  Setelah sukses : hasil di-upload ke {dest}, lalu instance dihapus")
