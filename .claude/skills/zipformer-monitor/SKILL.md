@@ -15,7 +15,7 @@ python zipformer/vastai/zipformer_status.py --drive    # + SHA-256 check of the 
 python zipformer/vastai/zipformer_status.py --wait     # blocks until a new epoch or a STATUS change, then prints status
 ```
 
-It finds the instance through the Vast.ai API (pass `--host/--port` if the user gives them). Its first line is `STATUS: <STATE>`; `--help` and the module docstring describe the rest. Reply to the user in their language.
+It finds the instance through the Vast.ai API on every call. Prefer that over pinning `--host/--port`: a host's public IP can change mid-run (seen 2026-11-19), and the API lookup follows it. Its first line is `STATUS: <STATE>`; `--help` and the module docstring describe the rest. Reply to the user in their language.
 
 ## Loop
 
@@ -34,7 +34,7 @@ A **report** is: the last few rows of the dev PER table with the rekor marked, `
 | `WATCHDOG_STOPPING`, `FINISHING`, `UPLOADING` | Report the stage; keep waiting with `--wait --poll 60`. |
 | `STOPPED` | Diagnose: read `ssh … 'tail -c 8000 /root/train_zipformer.log'` and the watchdog log, find the root cause, report it with the cost of the idle instance ($/hour from the status). Ask the user before any restart or destroy. |
 | `ENDED` | The run succeeded but the instance is still up (no `--destroy-when-done`, or destroy failed). Report and ask the user. |
-| `NO_INSTANCE` | Terminal. Verify the results the status lists on Drive: `averaged-*.pt`, `test_results.json`, `export/`. Report the final dev PER, test results, and the total epochs. Stop the loop. |
-| `SSH_FAILED` | Retry once with `--wait --poll 60`; if it persists, report it (the box may be restarting or gone). |
+| `NO_INSTANCE` | Terminal only after the run was finishing (`FINISHING` / `UPLOADING`) or the Drive results exist. Verify the results the status lists on Drive: `averaged-*.pt`, `test_results.json`, `export/`. Report the final dev PER, test results, and the total epochs. Stop the loop. If it appears mid-training with no results, it is suspect: list instances via the Vast.ai API and check SSH before concluding anything. |
+| `SSH_FAILED`, `API_ERROR` | Transient by default (`--wait` already skips them). Retry once with `--wait --poll 60`; if it persists, report it — the box may be restarting, its IP may have changed, or it is gone. |
 
 When the watchdog acted, the final report also states which epochs were averaged (the last 3 epochs up to the stop epoch) and that `num_epochs` on the box was lowered to that epoch.

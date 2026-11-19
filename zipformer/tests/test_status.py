@@ -33,6 +33,27 @@ def test_epoch_hours_averages_the_last_three_gaps():
     assert zs.epoch_hours(lines[:1]) is None
 
 
+def _wait_with(monkeypatch, states):
+    """Run wait_for_change over a scripted sequence of collect() results."""
+    seq = iter([{"state": s, "last": e} for s, e in states])
+    monkeypatch.setattr(zs, "collect", lambda args: next(seq))
+    monkeypatch.setattr(zs.time, "sleep", lambda s: None)
+    args = type("A", (), {"wait_timeout": 10**6, "poll": 1})()
+    return zs.wait_for_change(args)
+
+
+def test_wait_ignores_a_short_no_instance_blip(monkeypatch):
+    # 2026-11-19: the host's public IP changed and one API poll missed the instance
+    st = _wait_with(monkeypatch, [("TRAINING", 22), ("NO_INSTANCE", 0), ("API_ERROR", 0),
+                                  ("TRAINING", 22), ("TRAINING", 23)])
+    assert (st["state"], st["last"]) == ("TRAINING", 23)
+
+
+def test_wait_reports_no_instance_once_confirmed(monkeypatch):
+    st = _wait_with(monkeypatch, [("UPLOADING", 24)] + [("NO_INSTANCE", 0)] * zs.NO_INSTANCE_CONFIRMATIONS)
+    assert st["state"] == "NO_INSTANCE"
+
+
 @pytest.mark.parametrize(
     "sections, num_epochs, last, state",
     [

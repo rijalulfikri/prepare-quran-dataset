@@ -24,6 +24,8 @@ Contoh:
 """
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import re
@@ -50,7 +52,11 @@ STATES = {
     "STOPPED": "run berakhir dengan exit code != 0; instance hidup dan ditagih",
     "ENDED": "run berakhir sukses; instance masih hidup (tanpa --destroy-when-done atau destroy gagal)",
     "NO_INSTANCE": "tidak ada instance Vast.ai yang cocok (mis. sudah di-destroy)",
+    "API_ERROR": "API Vast.ai tidak bisa dibaca; keadaan instance tidak diketahui",
 }
+# --wait menerima NO_INSTANCE hanya setelah sekian poll berturut-turut: saat jaringan
+# host bermasalah (mis. IP publik mesin berganti) API bisa sesaat tidak melaporkannya
+NO_INSTANCE_CONFIRMATIONS = 3
 
 # Satu panggilan SSH: bagian-bagian dipisah baris "@@NAMA"
 REMOTE_PROBE = r"""
@@ -100,12 +106,20 @@ def run(cmd, timeout=120, stdin=None):
 
 
 def find_box(args):
-    """(host, port, instance_id) dari --host/--port atau Vast.ai API; None jika tidak ada."""
+    """(host, port, instance_id) dari --host/--port atau Vast.ai API.
+
+    Returns None jika API menjawab tanpa instance yang cocok, "API_ERROR" jika
+    API tidak bisa dibaca (mis. jaringan putus): itu bukan bukti instance hilang.
+    """
     if args.host and args.port:
         return args.host, str(args.port), None
     sys.path.insert(0, SCRIPT_DIR)
-    from vast_api import get_first_started_instance
+    from vast_api import get_first_started_instance, get_instances
 
+    # get_instances mencetak pesan + traceback saat gagal
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        if get_instances() is None:
+            return "API_ERROR"
     info = get_first_started_instance(args.label or os.getenv("VAST_LABEL"), args.host, verbose=False)
     if not info:
         return None
@@ -213,6 +227,8 @@ def collect(args):
     box = find_box(args)
     if box is None:
         return {"state": "NO_INSTANCE"}
+    if box == "API_ERROR":
+        return {"state": "API_ERROR"}
     host, port, instance_id = box
     s = probe(args, host, port)
     if s is None:
@@ -261,6 +277,9 @@ def print_status(args, st):
         return
     if st["state"] == "SSH_FAILED":
         print(f"STATUS: SSH_FAILED — box {st['host']}:{st['port']} tidak bisa dihubungi lewat SSH")
+        return
+    if st["state"] == "API_ERROR":
+        print(f"STATUS: API_ERROR — {STATES['API_ERROR']}")
         return
     s = st["sections"]
     print(f"STATUS: {st['state']} — {STATES[st['state']]}")
@@ -340,10 +359,15 @@ def wait_for_change(args):
     """Poll sampai ada epoch baru, STATUS berubah, atau --wait-timeout habis."""
     start = collect(args)
     deadline = time.monotonic() + args.wait_timeout
+    no_instance = 0
     while time.monotonic() < deadline:
         time.sleep(args.poll)
         st = collect(args)
-        if st["state"] == "SSH_FAILED":
+        # Gangguan sesaat bukan perubahan keadaan run
+        if st["state"] in ("SSH_FAILED", "API_ERROR"):
+            continue
+        no_instance = no_instance + 1 if st["state"] == "NO_INSTANCE" else 0
+        if 0 < no_instance < NO_INSTANCE_CONFIRMATIONS and start["state"] != "NO_INSTANCE":
             continue
         if st["state"] != start["state"] or st.get("last", 0) != start.get("last", 0):
             print(f"PERUBAHAN: {start['state']} epoch {start.get('last', 0)} -> {st['state']} epoch {st.get('last', 0)}\n")
