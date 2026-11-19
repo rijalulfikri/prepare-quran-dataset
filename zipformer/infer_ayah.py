@@ -12,7 +12,11 @@ librispeech zipformer recipe matches the pinned submodule:
         --icefall-root /path/to/icefall   # or set ICEFALL_ROOT; default: external/icefall
 
 With `--sura/--aya` the reference phonemes come from `quran_phonetizer` (Hafs,
-madd lengths from the options below) and the script prints the PER. Note that a
+madd lengths from the options below) and the script prints the PER. Reciters
+differ (e.g. moshaf 0.0 reads madd 'arid as 2, the default reference uses 4),
+so for a dataset recording pass `--moshaf <id>`: the reference then uses that
+moshaf's attributes from the dataset metadata, exactly like the training
+labels (needs network on first use and HUGGINGFACE_TOKEN, read from .env). Note that a
 dataset file name like `002.0255.flac` is `<surah>.<segment>`, not always an
 ayah number; for such files pass the cut's label with `--reference`. Works with
 `epoch-*.pt`, `checkpoint-*.pt` and `averaged-*.pt` (all store `model` and
@@ -55,6 +59,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                                        "(e.g. a cut's supervision text from cuts_test.jsonl.gz)")
     p.add_argument("--chunk-size", type=int, help="streaming chunk in frames (default: export_chunk_size)")
     p.add_argument("--left-context", type=int, help="left context in frames (default: export_left_context)")
+    p.add_argument("--moshaf", help="build the reference with this moshaf's recitation attributes (e.g. 0.0), "
+                                    "exactly like the training labels; overrides the --madd-* options")
+    p.add_argument("--segment", help="segment index for --moshaf's per-segment overrides "
+                                     "(default: the audio file name, e.g. 114.0002)")
     p.add_argument("--madd-monfasel", type=int, default=4, help="reference madd munfasil length (default: 4)")
     p.add_argument("--madd-mottasel", type=int, default=4, help="reference madd muttasil length (default: 4)")
     p.add_argument("--madd-aared", type=int, default=4, help="reference madd 'arid lissukun length (default: 4)")
@@ -93,18 +101,58 @@ def fbank(audio: Path, num_mel_bins: int) -> torch.Tensor:
     return torch.from_numpy(feats).unsqueeze(0)
 
 
+MOSHAF_REPO = "obadx/mualem-recitations-annotated"  # data_prep.METADATA_DATASET
+MOSHAF_FILE = "moshaf_pool.parquet"  # data file of its "moshaf_metadata" config
+
+
+def _hf_token() -> str | None:
+    token = os.environ.get("HUGGINGFACE_TOKEN") or os.environ.get("HF_TOKEN")
+    if token:
+        return token
+    from dotenv import dotenv_values
+
+    return dotenv_values(ZIPFORMER_DIR / ".env").get("HUGGINGFACE_TOKEN")
+
+
+def moshaf_attributes(moshaf_id: str, segment: str | None):
+    """`MoshafAttributes` the training labels used for this moshaf (and segment).
+
+    Reads the same metadata rows as `data_prep.load_moshaf_metadata` (straight
+    from the parquet file, cached by huggingface_hub, so the `datasets` package
+    is not needed) and applies the same per-segment overrides.
+    """
+    import pyarrow.parquet as pq
+    from huggingface_hub import hf_hub_download
+    from quran_transcript import MoshafAttributes
+
+    from prepare_quran_dataset.moshaf_ways import build_special_moshaf_attrs, resolve_moshaf_attr
+
+    path = hf_hub_download(MOSHAF_REPO, MOSHAF_FILE, repo_type="dataset", token=_hf_token())
+    metadata = {str(row["id"]): row for row in pq.read_table(path).to_pylist()}
+    if moshaf_id not in metadata:
+        raise SystemExit(f"moshaf {moshaf_id} not in {MOSHAF_REPO}; known: {', '.join(sorted(metadata))}")
+    base = {moshaf_id: MoshafAttributes(**metadata[moshaf_id])}
+    return resolve_moshaf_attr(moshaf_id, segment or "", base, build_special_moshaf_attrs(metadata))
+
+
 def reference_phonemes(sura: int, aya: int, args: argparse.Namespace) -> tuple[str, str]:
     """`(uthmani, phonemes)` of an ayah, phonetized like the training labels."""
     from quran_transcript import Aya, MoshafAttributes, quran_phonetizer
 
     uthmani = Aya(sura, aya).get().uthmani
-    attr = MoshafAttributes(
-        rewaya="hafs",
-        madd_monfasel_len=args.madd_monfasel,
-        madd_mottasel_len=args.madd_mottasel,
-        madd_mottasel_waqf=args.madd_mottasel,
-        madd_aared_len=args.madd_aared,
-    )
+    if getattr(args, "moshaf", None):
+        segment = args.segment or Path(args.audio).stem
+        attr = moshaf_attributes(args.moshaf, segment)
+        print(f"moshaf     : {args.moshaf} segment {segment} (madd monfasel {attr.madd_monfasel_len}, "
+              f"mottasel {attr.madd_mottasel_len}, aared {attr.madd_aared_len})")
+    else:
+        attr = MoshafAttributes(
+            rewaya="hafs",
+            madd_monfasel_len=args.madd_monfasel,
+            madd_mottasel_len=args.madd_mottasel,
+            madd_mottasel_waqf=args.madd_mottasel,
+            madd_aared_len=args.madd_aared,
+        )
     return uthmani, quran_phonetizer(uthmani, attr, remove_spaces=True).phonemes
 
 
