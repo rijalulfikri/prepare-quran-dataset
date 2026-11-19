@@ -536,6 +536,9 @@ def launch_training(args, host, port, wait_ssh=False):
     if early_stop:
         print(f"  Early stop     : {args.early_stop_patience} epoch tanpa perbaikan "
               f">= {args.early_stop_min_improvement:.0%}; log: {ssh_str} 'tail -f /root/zipformer_watchdog.log'")
+    print(f"  Status         : python {os.path.relpath(os.path.join(SCRIPT_DIR, 'zipformer_status.py'))} "
+          f"--host {host} --port {port}")
+    print("  Pantau dengan Claude Code: /zipformer-monitor")
     if args.destroy_when_done:
         dest = args.results_remote or "<rclone_checkpoint_path>-results"
         print(f"  Setelah sukses : hasil di-upload ke {dest}, lalu instance dihapus")

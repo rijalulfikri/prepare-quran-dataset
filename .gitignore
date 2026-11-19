@@ -25,6 +25,7 @@ frontend/temp/
 .gradio
 recordings/
 .claude/*
+!.claude/skills/
 rclone.conf
 .superpowers/
 .vscode/launch.json
