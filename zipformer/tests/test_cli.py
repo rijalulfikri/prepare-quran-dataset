@@ -1,5 +1,6 @@
 # zipformer/tests/test_cli.py
 import types
+from pathlib import Path
 
 import pytest
 
@@ -177,3 +178,93 @@ def test_train_loop_main_loads_dotenv_first(monkeypatch):
     monkeypatch.setattr(tl, "load_dotenv", _raise_loaded)
     with pytest.raises(_DotenvLoaded):
         tl.main(["--config", "does-not-exist.yml"])
+
+
+# ---------------------------------------------------------------- eval sets on old checkpoints
+
+
+def test_evalsets_stage_runs_prepare_first_and_is_not_in_all():
+    assert tz.stages_to_run("evalsets") == ["prepare", "evalsets"]
+    assert "evalsets" not in tz.stages_to_run("all")
+    assert tz.parse_args(["--stage", "evalsets", "--checkpoint", "a.pt", "--checkpoint", "r:b.pt"]).checkpoint == ["a.pt", "r:b.pt"]
+
+
+def test_evalsets_without_checkpoint_fails(monkeypatch):
+    monkeypatch.setattr(tz, "stage_prepare", lambda cfg, args: None)
+    assert tz.main(["--stage", "evalsets", "--device", "cpu"]) == 1
+
+
+def test_local_checkpoint_downloads_a_remote_once(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run(cmd, check):
+        calls.append(cmd)
+        Path(cmd[3]).write_text("pt")
+
+    monkeypatch.setattr(tz, "check_rclone", lambda: None)
+    monkeypatch.setattr(tz.subprocess, "run", fake_run)
+    src = "remote:runs/v0-results/averaged-3.pt"
+    assert tz._local_checkpoint(src, tmp_path) == tmp_path / "averaged-3.pt"
+    assert tz._local_checkpoint(src, tmp_path) == tmp_path / "averaged-3.pt"
+    assert len(calls) == 1 and calls[0][:3] == ["rclone", "copyto", src]
+    local = tmp_path / "local.pt"
+    local.write_text("x")
+    assert tz._local_checkpoint(str(local), tmp_path / "cache") == local
+    with pytest.raises(FileNotFoundError):
+        tz._local_checkpoint("missing.pt", tmp_path)
+
+
+@pytest.fixture
+def eval_box(tmp_path, tiny_cfg_factory, tiny_data_dir_eval, fake_qdat):
+    """A tiny config with every eval set over a copy of `tiny_data_dir_eval`, plus a tiny model checkpoint."""
+    import shutil
+
+    import torch
+
+    pytest.importorskip("k2")
+    from quran_zipformer.model import build_model
+
+    data = tmp_path / "data"
+    shutil.copytree(tiny_data_dir_eval, data)
+    cfg = tiny_cfg_factory(
+        data_dir=str(data), output_dir=str(tmp_path / "out"), num_workers=0, max_duration=10, avg_last_k=1, keep_last_k=1,
+        dev_unseen_cuts_per_moshaf=2, eval_qdat=True, stress_sets=["vol-20db", "reverb", "speed1.25"],
+    )
+    yml = tmp_path / "cfg.yml"
+    cfg.to_yaml(yml)
+    pt = tmp_path / "epoch-30.pt"
+    torch.save({"model": build_model(cfg, 44).state_dict(), "epoch": 30}, pt)
+    return cfg, yml, pt
+
+
+SET_KEYS = {"per_phonemes", "silence_per", "num_speech", "num_silence",
+            *(f"{n}/{k}" for n in ("dev_unseen", "dev_unseen_vol-20db", "dev_unseen_reverb", "dev_unseen_speed1.25", "qdat")
+              for k in ("per_phonemes", "num_speech"))}
+
+
+def test_evalsets_scores_an_old_checkpoint_without_training(eval_box, monkeypatch):
+    import json
+
+    cfg, yml, pt = eval_box
+    monkeypatch.setattr(tz, "stage_prepare", lambda cfg, args: None)
+    monkeypatch.setattr(tz, "stage_train", lambda cfg, args: pytest.fail("must not train"))
+    assert tz.main(["--config", str(yml), "--stage", "evalsets", "--checkpoint", str(pt), "--device", "cpu"]) == 0
+    row = json.loads((Path(cfg.output_dir) / "eval_sets" / "epoch-30.json").read_text())
+    assert row["checkpoint"] == str(pt) and row["epoch"] == 30
+    assert SET_KEYS <= set(row)
+    assert row["qdat/num_speech"] == 2 and row["dev_unseen/num_speech"] == 6
+
+
+def test_eval_stage_writes_eval_set_results_for_the_averaged_model(eval_box, monkeypatch):
+    import json
+    import shutil
+
+    cfg, yml, pt = eval_box
+    out = Path(cfg.output_dir)
+    out.mkdir(parents=True)
+    shutil.copy(pt, out / "averaged-1.pt")
+    (out / "test_results.json").write_text("{}")  # test split already scored: only the eval sets run
+    assert tz.main(["--config", str(yml), "--stage", "eval", "--device", "cpu"]) == 0
+    row = json.loads((out / tz.EVAL_SETS_RESULTS).read_text())
+    assert row["checkpoint"] == "averaged-1.pt" and SET_KEYS <= set(row)
+    assert (out / "test_results.json").read_text() == "{}"

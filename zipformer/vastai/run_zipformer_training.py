@@ -380,6 +380,8 @@ def build_watchdog_command(args):
         f"REPO_ZIPFORMER_DIR={REMOTE_REPO_DIR}/zipformer",
         f"RELAUNCH={REMOTE_RELAUNCH}",
     ]
+    if getattr(args, "early_stop_metric", None):
+        env.append(f"METRIC={args.early_stop_metric}")
     if args.config:
         # Watchdog membaca dan mengubah num_epochs di config yang sama dengan pipeline
         env.append(f"CONFIG_FILE={REMOTE_CONFIG}")
@@ -432,6 +434,9 @@ def main():
                         metavar="FRAC",
                         help="perbaikan relatif minimal agar sebuah epoch dihitung rekor baru "
                              f"(default: {DEFAULT_EARLY_STOP_MIN_IMPROVEMENT})")
+    parser.add_argument("--early-stop-metric", metavar="KEY",
+                        help="kunci dev_metrics.jsonl untuk aturan rekor, mis. qdat/per_phonemes atau "
+                             "dev_unseen/per_phonemes (default: early_stop_metric di config training)")
     parser.add_argument("--follow", action="store_true",
                         help="tampilkan log training setelah dijalankan (Ctrl+C tidak menghentikan training)")
     parser.add_argument("--dry-run", action="store_true", help="cetak command tanpa menjalankannya")
@@ -535,7 +540,8 @@ def launch_training(args, host, port, wait_ssh=False):
     print(f"  Attach tmux    : {ssh_str} -t 'tmux attach -t {TMUX_SESSION}'")
     if early_stop:
         print(f"  Early stop     : {args.early_stop_patience} epoch tanpa perbaikan "
-              f">= {args.early_stop_min_improvement:.0%}; log: {ssh_str} 'tail -f /root/zipformer_watchdog.log'")
+              f">= {args.early_stop_min_improvement:.0%} pada "
+              f"{args.early_stop_metric or 'early_stop_metric di config'}; log: {ssh_str} 'tail -f /root/zipformer_watchdog.log'")
     print(f"  Status         : python {os.path.relpath(os.path.join(SCRIPT_DIR, 'zipformer_status.py'))} "
           f"--host {host} --port {port}")
     print("  Pantau dengan Claude Code: /zipformer-monitor")
@@ -543,7 +549,7 @@ def launch_training(args, host, port, wait_ssh=False):
         dest = args.results_remote or "<rclone_checkpoint_path>-results"
         print(f"  Setelah sukses : hasil di-upload ke {dest}, lalu instance dihapus")
     else:
-        print(f"  Ambil hasil    : scp -P {port} -r root@{host}:{REMOTE_REPO_DIR}/zipformer/results-zipformer-v0/export ./")
+        print(f"  Ambil hasil    : scp -P {port} -r root@{host}:{REMOTE_REPO_DIR}/zipformer/<output_dir>/export ./")
 
     if args.follow:
         print("\nMenampilkan log (Ctrl+C hanya menghentikan tampilan log, bukan training)...\n")

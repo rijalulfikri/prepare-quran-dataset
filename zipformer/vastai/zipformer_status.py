@@ -7,8 +7,10 @@ Status satu run training Zipformer di Vast.ai yang dijalankan oleh
 run_zipformer_training.py, dari komputer lokal:
 
 - STATUS: satu kata keadaan run (lihat STATES), untuk manusia dan agen.
-- Tabel dev PER per epoch dengan rekor dan hitungan early stop memakai aturan
-  zipformer_watchdog.sh (patience dan ambang dibaca dari log watchdog di box).
+- Tabel metrik early stop per epoch (kunci early_stop_metric, bawaan PER QDAT;
+  dev_metrics.jsonl run lama tanpa kunci itu memakai PER dev lama) dengan rekor dan
+  hitungan early stop memakai aturan zipformer_watchdog.sh (patience, ambang dan
+  metrik dibaca dari log watchdog di box), plus PER tiap eval set epoch terakhir.
 - Kecepatan per epoch, perkiraan selesai, sisa credit Vast.ai dan biaya.
 - Watchdog, GPU, error terakhir di log, tahap destroy.
 - Tanpa instance: isi folder hasil (<rclone_checkpoint_path>-results) di Drive.
@@ -41,6 +43,8 @@ ZIPFORMER_DIR = os.path.dirname(SCRIPT_DIR)
 REMOTE_Z = "/root/prepare-quran-dataset/zipformer"
 DEFAULT_PATIENCE = 4
 DEFAULT_MIN_IMPROVEMENT = 0.05
+DEFAULT_METRIC = "qdat/per_phonemes"
+LEGACY_METRIC = "per_phonemes"  # PER dev lama; satu-satunya kunci di run lama
 FINISH_HOURS = 1.0  # averaging + test eval + export + upload, perkiraan kasar
 
 STATES = {
@@ -78,6 +82,7 @@ echo @@NOW; date -u '+%%F %%T'
 echo @@CONFIG; echo "$cfg"
 echo @@NUM_EPOCHS; val num_epochs
 echo @@CKPT_PATH; val rclone_checkpoint_path
+echo @@EARLY_STOP_METRIC; val early_stop_metric
 echo @@TRAINER; echo "$pid"
 # Dijangkarkan ke awal command line: perintah sesi tmux juga memuat nama-nama skrip ini
 echo @@SHELL; pgrep -f '^bash train_zipformer\.sh' | head -1
@@ -90,7 +95,7 @@ echo @@FINISH; cur | grep -a 'Destroy instance\|sedang dihapus\|TIDAK dihapus\|d
 echo @@ERRORS; cur | tail -c 200000 | tr '\r' '\n' | grep -a 'Traceback\|Error\|ERROR\|Killed\|CUDA out of memory' | grep -v 'Whitening\|ScheduledFloat' | tail -4
 echo @@STAGE; cur | tail -c 200000 | tr '\r' '\n' | grep -a 'INFO train_zipformer\|averaged\|test results\|all [0-9]* epochs already complete\|rebuilding training cuts' | tail -2
 echo @@WATCHDOG; tmux has-session -t watchdog 2>/dev/null && echo session; pgrep -f '^bash /root/zipformer_watchdog\.sh' >/dev/null && echo running; tail -3 /root/zipformer_watchdog.log 2>/dev/null
-echo @@WATCHDOG_PARAMS; grep -a -o 'patience [0-9]*, min relative improvement [0-9.]*' /root/zipformer_watchdog.log 2>/dev/null | tail -1
+echo @@WATCHDOG_PARAMS; grep -a -o 'patience [0-9]*, min relative improvement [0-9.]*\(, metric [^ ,]*\)\?' /root/zipformer_watchdog.log 2>/dev/null | tail -1
 echo @@GPU; nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader 2>/dev/null
 """
 
@@ -151,22 +156,44 @@ def first(sections, key):
     return lines[0].strip() if lines else ""
 
 
-def per_table(metrics_lines, min_rel):
-    """Baris tabel + (best_epoch, since) dengan aturan zipformer_watchdog.sh."""
+def read_metrics(metrics_lines):
+    """{epoch: baris} dari dev_metrics.jsonl; baris kosong / terpotong dilewati."""
     rows = {}
     for line in metrics_lines:
-        if line.strip():
+        try:
             r = json.loads(line)
-            rows[r["epoch"]] = r
+            rows[int(r["epoch"])] = r
+        except (ValueError, KeyError, TypeError):
+            pass
+    return rows
+
+
+def per_table(metrics_lines, min_rel, metric=LEGACY_METRIC):
+    """(baris tabel, best_epoch, since, kunci_dipakai) dengan aturan zipformer_watchdog.sh.
+
+    Baris tabel: (epoch, batch, nilai metrik, silence PER, PER dev lama, rekor baru?).
+    Jika belum ada baris yang memuat `metric` (mis. run lama), dipakai PER dev lama.
+    """
+    all_rows = read_metrics(metrics_lines)
+    key = metric if any(r.get(metric) is not None for r in all_rows.values()) else LEGACY_METRIC
+    rows = {ep: r for ep, r in all_rows.items() if r.get(key) is not None}
     best, table = None, []
     for ep in sorted(rows):
-        per = rows[ep]["per_phonemes"]
-        new_best = best is None or per < rows[best]["per_phonemes"] * (1 - min_rel)
+        value = rows[ep][key]
+        new_best = best is None or value < rows[best][key] * (1 - min_rel)
         if new_best:
             best = ep
-        table.append((ep, rows[ep].get("batch_idx_train"), per, rows[ep].get("silence_per"), new_best))
+        r = rows[ep]
+        table.append((ep, r.get("batch_idx_train"), value, r.get("silence_per"), r.get(LEGACY_METRIC), new_best))
     since = (max(rows) - best) if rows else 0
-    return table, best, since
+    return table, best, since, key
+
+
+def eval_set_pers(row):
+    """{nama set: PER} satu baris dev_metrics.jsonl; dev lama bernama 'dev'."""
+    out = {"dev": row.get(LEGACY_METRIC)}
+    out.update({k.rsplit("/", 1)[0]: v for k, v in row.items() if k.endswith("/per_phonemes")})
+    return {k: v for k, v in out.items() if v is not None}
 
 
 def epoch_hours(epoch_end_lines):
@@ -234,10 +261,14 @@ def collect(args):
     if s is None:
         return {"state": "SSH_FAILED", "host": host, "port": port, "instance_id": instance_id}
     params = first(s, "WATCHDOG_PARAMS")
-    m = re.match(r"patience (\d+), min relative improvement ([0-9.]+)", params)
+    m = re.match(r"patience (\d+), min relative improvement ([0-9.]+)(?:, metric (\S+))?", params)
     patience = int(m.group(1)) if m else args.patience
     min_rel = float(m.group(2)) if m else args.min_improvement
-    table, best, since = per_table(s.get("METRICS", []), min_rel)
+    # metrik yang dipakai watchdog > --metric > early_stop_metric di config box > bawaan
+    metric = (m.group(3) if m and m.group(3) else None) or args.metric or first(s, "EARLY_STOP_METRIC") or DEFAULT_METRIC
+    table, best, since, used = per_table(s.get("METRICS", []), min_rel, metric)
+    rows = read_metrics(s.get("METRICS", []))
+    latest = (max(rows), eval_set_pers(rows[max(rows)])) if rows else (0, {})
     num_epochs = first(s, "NUM_EPOCHS")
     num_epochs = int(num_epochs) if num_epochs.isdigit() else None
     last = table[-1][0] if table else 0
@@ -245,6 +276,7 @@ def collect(args):
         "state": classify(s, num_epochs, last), "host": host, "port": port, "instance_id": instance_id,
         "sections": s, "table": table, "best": best, "since": since, "patience": patience,
         "min_rel": min_rel, "watchdog_params_known": bool(m), "num_epochs": num_epochs, "last": last,
+        "metric": metric, "metric_used": used, "latest_sets": latest,
         "epoch_hours": epoch_hours(s.get("EPOCH_END", [])),
     }
 
@@ -288,17 +320,23 @@ def print_status(args, st):
 
     table, best = st["table"], st["best"]
     rule = f"rekor = < rekor x {1 - st['min_rel']:.2f}" + ("" if st["watchdog_params_known"] else " (default; watchdog tidak ditemukan)")
-    print(f"\nDev PER ({rule}):")
-    print("  epoch     batch   PER fonem   silence PER")
-    for ep, batch, per, sil, new_best in table[-args.rows:]:
+    used = st["metric_used"]
+    fallback = f"; {st['metric']} belum ada, memakai PER dev lama" if used != st["metric"] else ""
+    print(f"\nMetrik early stop {used} ({rule}{fallback}):")
+    print(f"  epoch     batch   {'metrik':>9}   PER dev lama   silence PER")
+    for ep, batch, value, sil, dev_per, new_best in table[-args.rows:]:
         mark = "  <- rekor" + (" berlaku" if ep == best else "") if new_best else ""
         sil_s = f"{sil * 100:.3f}%" if sil is not None else "-"
-        print(f"  {ep:5d} {batch or 0:9d}   {per * 100:8.3f}%   {sil_s:>10}{mark}")
+        dev_s = f"{dev_per * 100:.3f}%" if dev_per is not None else "-"
+        print(f"  {ep:5d} {batch or 0:9d}   {value * 100:8.3f}%   {dev_s:>12}   {sil_s:>10}{mark}")
     if not table:
         print("  (belum ada epoch selesai)")
     else:
         print(f"Epoch tanpa rekor: {st['since']}/{st['patience']}"
               f" (rekor berlaku epoch {best}, {table[[r[0] for r in table].index(best)][2] * 100:.3f}%)")
+    latest_ep, latest_sets = st["latest_sets"]
+    if len(latest_sets) > 1:
+        print(f"PER eval set epoch {latest_ep}: " + ", ".join(f"{k} {v * 100:.3f}%" for k, v in latest_sets.items()))
 
     hours, num_epochs, last = st["epoch_hours"], st["num_epochs"], st["last"]
     if hours:
@@ -393,6 +431,9 @@ def main():
                         help="dipakai jika log watchdog tidak ada di box (default: 4)")
     parser.add_argument("--min-improvement", type=float, default=DEFAULT_MIN_IMPROVEMENT,
                         help="dipakai jika log watchdog tidak ada di box (default: 0.05)")
+    parser.add_argument("--metric",
+                        help="kunci dev_metrics.jsonl untuk aturan rekor jika log watchdog tidak menyebutkannya "
+                             f"(default: early_stop_metric di config box, lalu {DEFAULT_METRIC})")
     parser.add_argument("--rows", type=int, default=8, help="jumlah epoch terakhir di tabel (default: 8)")
     parser.add_argument("--drive", action="store_true", help="cocokkan SHA-256 epoch-*.pt terbaru di Drive")
     parser.add_argument("--wait", action="store_true", help="tunggu epoch baru / perubahan STATUS, lalu cetak status")

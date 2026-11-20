@@ -1,5 +1,7 @@
 import json
+import random
 
+import numpy as np
 import pytest
 from lhotse import CutSet
 
@@ -171,3 +173,129 @@ def test_train_dataloader_logs_rebuild_and_fast_forward(tiny_data_dir_big, cfg, 
         dm.train_dataloader(cfg, tiny_data_dir_big, epoch=1, sampler_state=state, batches_consumed=2)
     assert "rebuilding training cuts for epoch 1 (may take a few minutes)" in caplog.text
     assert "fast-forwarding sampler by 2 batches" in caplog.text
+
+
+# ---------------------------------------------------------------- augmentation (v1)
+
+
+V1_AUG = dict(
+    speed_factor_ranges=[(0.85, 0.95), (1.0, 1.0), (1.05, 1.25)],
+    cutmix_snr=(5.0, 20.0),
+    reverb_p=0.3,
+    volume_p=0.5,
+)
+
+
+def test_defaults_rebuild_the_v0_train_cuts_exactly(tiny_data_dir_big, cfg):
+    # v0: [*base.perturb_speed(0.9), *base, *base.perturb_speed(1.1)] shuffled with cfg.seed
+    base = dm.load_cuts(tiny_data_dir_big, "train")
+    v0 = CutSet.from_cuts([*base.perturb_speed(0.9), *base, *base.perturb_speed(1.1)])
+    v0 = v0.shuffle(rng=random.Random(cfg.seed))
+    new = dm._train_cuts(cfg, tiny_data_dir_big)
+    assert [c.id for c in new] == [c.id for c in v0]
+    assert [c.duration for c in new] == [c.duration for c in v0]
+
+
+def test_defaults_keep_the_v0_cut_transforms(tiny_data_dir, cfg):
+    from lhotse.dataset import CutMix
+
+    cfg.num_workers = 0
+    ds = dm.train_dataloader(cfg, tiny_data_dir).dataset
+    assert [type(t) for t in ds.cut_transforms] == [CutMix]
+    assert ds.cut_transforms[0].snr == (10.0, 20.0) and ds.cut_transforms[0].p == 0.5
+    off = cfg.model_copy(update={"speed_perturb": False})
+    assert [c.id for c in dm._train_cuts(off, tiny_data_dir)] == [c.id for c in dm.load_cuts(tiny_data_dir, "train")]
+
+
+def test_augmentation_order_reverb_mix_gain(tiny_data_dir, cfg):
+    from lhotse.dataset import CutMix
+
+    cfg = cfg.model_copy(update=V1_AUG)
+    cfg.num_workers = 0
+    cfg.max_duration = 10
+    ds = dm.train_dataloader(cfg, tiny_data_dir).dataset
+    assert [type(t) for t in ds.cut_transforms] == [dm.RandomReverb, CutMix, dm.RandomGainDb]
+    assert ds.cut_transforms[1].snr == (5.0, 20.0)
+    eval_ds = dm.eval_dataloader(cfg, dm.load_cuts(tiny_data_dir, "dev")).dataset
+    assert eval_ds.cut_transforms == []
+    # a batch goes through all three
+    _, _, texts, cuts = dm.batch_to_tensors(next(iter(dm.train_dataloader(cfg, tiny_data_dir))))
+    assert len(texts) == len(cuts) > 0
+
+
+def test_gain_is_uniform_in_db_not_linear(tiny_data_dir):
+    gain = dm.RandomGainDb(1.0, (-30.0, 6.0), seed=0)
+    gain.rng = random.Random(0)
+    db = np.array([gain.draw_db() for _ in range(20000)])
+    assert db.min() >= -30 and db.max() <= 6
+    # uniform in dB: a quarter of the draws below -21 dB (linear 0.125..2 would give none)
+    assert abs((db < -21).mean() - 0.25) < 0.02
+    assert abs(db.mean() - (-12.0)) < 0.5
+    cut = dm.load_cuts(tiny_data_dir, "train")[0]
+    out = dm.RandomGainDb(1.0, (-20.0, -20.0), seed=0)(CutSet.from_cuts([cut]))[0]
+    np.testing.assert_allclose(out.load_audio(), cut.load_audio() * 0.1, rtol=1e-5, atol=1e-7)
+    assert out.id == cut.id  # ids are preserved
+
+
+def test_transforms_apply_with_probability_p(tiny_data_dir):
+    cuts = dm.load_cuts(tiny_data_dir, "train")
+    untouched = dm.RandomReverb(0.0, seed=0)(cuts)
+    assert [c.recording.transforms for c in untouched] == [c.recording.transforms for c in cuts]
+    rev = dm.RandomReverb(1.0, seed=0)(cuts)
+    assert all(type(c.recording.transforms[-1]).__name__ == "ReverbWithImpulseResponse" for c in rev)
+    assert [c.id for c in rev] == [c.id for c in cuts]
+
+
+def test_copy_factors_are_deterministic_on_grid_and_in_range(cfg):
+    v1 = cfg.model_copy(update=V1_AUG)
+    ids = [f"moshaf_6.0__{i}" for i in range(400)]
+    factors = [dm.copy_factors(v1, i) for i in ids]
+    assert factors == [dm.copy_factors(v1, i) for i in ids]
+    slow, mid, fast = zip(*factors)
+    assert set(slow) == {0.85, 0.9, 0.95} and set(mid) == {1.0} and set(fast) == {1.05, 1.1, 1.15, 1.2, 1.25}
+    assert dm.copy_factors(cfg, "x") == [0.9, 1.0, 1.1]
+    assert dm.copy_factors(cfg.model_copy(update={"speed_perturb": False}), "x") == [1.0]
+
+
+def test_frame_budget_is_checked_per_copy_factor(cfg, make_cut_in_memory):
+    # 1 s, 47 labels: (100 - 7) // 2 = 46 frames at 1.0 and (90 - 7) // 2 = 41 at 1.1 are
+    # too few, 0.9 gives (111 - 7) // 2 = 52; the cut keeps its slow copy instead of
+    # being dropped whole
+    cut = make_cut_in_memory("c", 1.0, "بت" * 23 + "ب")
+    ok = make_cut_in_memory("ok", 1.0, "ب")
+    kept, dropped = dm.speed_copies(cfg, CutSet.from_cuts([cut, ok]))
+    assert sorted(c.id for c in kept) == ["c_sp0.9", "ok", "ok_sp0.9", "ok_sp1.1"]
+    assert sorted(dropped) == ["c", "c_sp1.1"]
+
+
+def test_v1_epoch_length_stays_close_to_v0(tiny_data_dir_big, cfg):
+    v0 = sum(c.duration for c in dm._train_cuts(cfg, tiny_data_dir_big))
+    v1 = sum(c.duration for c in dm._train_cuts(cfg.model_copy(update=V1_AUG), tiny_data_dir_big))
+    assert abs(v1 / v0 - 1) < 0.05
+
+
+@pytest.mark.parametrize("workers, cutmix_p", [(0, 0.0), (2, 0.0), (0, 0.5), (2, 0.5)])
+def test_sampler_resume_is_exact_with_v1_augmentation(tiny_data_dir_big, cfg, workers, cutmix_p):
+    """Same cuts in every batch after a resume, with v1's mixed speed factors.
+
+    With CutMix on, only the order *inside* a batch may differ: CutMix pads the
+    cuts it mixes, the dataset sorts each batch by duration, and CutMix's RNG
+    restarts with the resumed loader (true for v0 too; its equal-length test
+    cuts hid it). Without CutMix the order is exact as well.
+    """
+    cfg = cfg.model_copy(update={**V1_AUG, "cutmix_p": cutmix_p})
+    cfg.num_workers = workers
+    cfg.max_duration = 4
+    ref = [_ids(b) for b in dm.train_dataloader(cfg, tiny_data_dir_big, epoch=1)]
+    assert len(ref) >= 10
+    loader = dm.train_dataloader(cfg, tiny_data_dir_big, epoch=1)
+    it = iter(loader)
+    consumed = [_ids(next(it)) for _ in range(4)]
+    state = loader.sampler.state_dict()
+    del it, loader
+    resumed = dm.train_dataloader(cfg, tiny_data_dir_big, epoch=1, sampler_state=state, batches_consumed=4)
+    got = consumed + [_ids(b) for b in resumed]
+    if cutmix_p == 0:
+        assert got == ref
+    else:
+        assert [sorted(b) for b in got] == [sorted(b) for b in ref]

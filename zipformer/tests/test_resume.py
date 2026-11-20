@@ -14,11 +14,7 @@ from quran_zipformer import checkpointing as ck  # noqa: E402
 from quran_zipformer import train_loop as tl  # noqa: E402
 
 needs_rclone = pytest.mark.skipif(shutil.which("rclone") is None, reason="rclone not installed")
-
-
-@pytest.fixture(autouse=True)
-def _no_wandb(monkeypatch):
-    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+# W&B stays off through conftest's autouse `_no_wandb` (empty key, WANDB_MODE=disabled)
 
 
 def _dump(pt):  # fresh interpreter = "new process"
@@ -64,6 +60,29 @@ def test_resumed_run_sees_exact_next_batches(tmp_path, tiny_cfg, tiny_data_dir_b
     assert r["first_lrs"] == saved_lrs  # LR continues, not restarted by warmup
     assert r["batch_idx_train"] == 6
     assert "resume: source=local checkpoint=checkpoint-3.pt epoch=1 batch_idx_train=3" in resumed.stderr
+
+
+def test_resume_with_v1_augmentation_sees_the_same_next_batches(tmp_path, tiny_cfg, tiny_data_dir_big, tokens):
+    # mixed speed factors per copy, reverb, gain and 5-20 dB CutMix: the CutSet is still
+    # fixed before batching, so a new process resumes on the same cuts per batch (CutMix
+    # can reorder cuts inside a batch, see test_datamodule)
+    cfg = tiny_cfg.model_copy(update=dict(
+        output_dir=str(tmp_path / "out"), speed_factor_ranges=[(0.85, 0.95), (1.0, 1.0), (1.05, 1.25)],
+        cutmix_snr=(5.0, 20.0), reverb_p=0.3, volume_p=0.5,
+    ))
+    ref = tl.run_steps_for_test(cfg, tiny_data_dir_big, tokens, n_batches=6)["cut_ids_per_batch"]
+    shutil.rmtree(tmp_path / "out")
+    tl.run_steps_for_test(cfg, tiny_data_dir_big, tokens, n_batches=3)
+    resumed = subprocess.run(
+        [sys.executable, "-m", "quran_zipformer.train_loop",
+         "--test-resume", "--config", str(tmp_path / "out/config.yml"),
+         "--data-dir", str(tiny_data_dir_big), "--n-batches", "3"],
+        check=True, capture_output=True, text=True,
+    )
+    r = json.loads(resumed.stdout.splitlines()[-1])
+    assert r["start_batch_idx_train"] == 3
+    assert [sorted(b) for b in r["cut_ids_per_batch"]] == [sorted(b) for b in ref[3:6]]
+    assert any("_sp1.25" in i or "_sp0.85" in i for b in ref for i in b)  # the new factors are in play
 
 
 @needs_rclone

@@ -3,7 +3,8 @@
 #
 # Dikirim dan dijalankan oleh run_zipformer_training.py --early-stop-patience N di
 # sesi tmux `watchdog`. Tiap POLL detik membaca dev_metrics.jsonl. Sebuah epoch
-# dihitung sebagai rekor baru hanya jika PER-nya < rekor x (1 - MIN_REL_IMPROVEMENT).
+# dihitung sebagai rekor baru hanya jika metriknya (METRIC, mis. PER QDAT) <
+# rekor x (1 - MIN_REL_IMPROVEMENT).
 # Jika PATIENCE epoch berturut-turut tanpa rekor baru (dan training masih berjalan,
 # epoch terakhir < num_epochs):
 #   1. SIGTERM ke trainer (berhenti rapi, checkpoint di-flush, exit 143),
@@ -15,6 +16,10 @@
 # Variabel environment (semua opsional):
 #   PATIENCE             epoch tanpa rekor sebelum berhenti (default 4)
 #   MIN_REL_IMPROVEMENT  perbaikan relatif minimal untuk rekor baru (default 0.05)
+#   METRIC               kunci dev_metrics.jsonl untuk aturan rekor (default: early_stop_metric
+#                        di CONFIG_FILE, atau qdat/per_phonemes). Jika belum ada baris yang
+#                        memuat kunci itu (mis. dev_metrics.jsonl run lama), dipakai per_phonemes
+#                        (dev lama) dan log menyebutkannya.
 #   POLL                 interval cek dalam detik (default 120)
 #   REPO_ZIPFORMER_DIR   folder zipformer di box (default /root/prepare-quran-dataset/zipformer)
 #   CONFIG_FILE          config training yang dipakai pipeline, sama seperti di
@@ -46,26 +51,34 @@ config_value() {
     sed -n "s/^$1:[[:space:]]*//p" "$CONFIG" | sed 's/[[:space:]]*#.*//; s/["'\'']//g' | head -1
 }
 
+METRIC=${METRIC:-$(config_value early_stop_metric)}
+METRIC=${METRIC:-qdat/per_phonemes}
+
 if [ -z "${METRICS:-}" ]; then
     out_dir=$(config_value output_dir)
     case "$out_dir" in /*) ;; *) out_dir="$Z/$out_dir" ;; esac
     METRICS="$out_dir/dev_metrics.jsonl"
 fi
 
-# prints: "<last_epoch> <best_epoch> <best_per> <epochs_since_best>"
+# prints: "<last_epoch> <best_epoch> <best_value> <epochs_since_best> <metric_key_used>"
 decision() {
-    python3 - "$METRICS" "$MIN_REL_IMPROVEMENT" <<'EOF'
+    python3 - "$METRICS" "$MIN_REL_IMPROVEMENT" "$METRIC" <<'EOF'
 import json, sys
-rows = {}
+all_rows = {}
 try:
     for line in open(sys.argv[1]):
-        if line.strip():
+        try:
             r = json.loads(line)
-            rows[r["epoch"]] = r["per_phonemes"]
+            all_rows[int(r["epoch"])] = r
+        except (ValueError, KeyError, TypeError):
+            pass  # blank or torn line (crash mid-append)
 except FileNotFoundError:
     pass
+# run lama tidak punya kunci baru: pakai PER dev lama
+key = sys.argv[3] if any(r.get(sys.argv[3]) is not None for r in all_rows.values()) else "per_phonemes"
+rows = {ep: r[key] for ep, r in all_rows.items() if r.get(key) is not None}
 if not rows:
-    print("0 0 nan 0")
+    print("0 0 nan 0", key)
     raise SystemExit
 min_rel = float(sys.argv[2])
 best_ep = None
@@ -73,7 +86,7 @@ for ep in sorted(rows):
     if best_ep is None or rows[ep] < rows[best_ep] * (1 - min_rel):
         best_ep = ep
 last = max(rows)
-print(last, best_ep, f"{rows[best_ep]:.6f}", last - best_ep)
+print(last, best_ep, f"{rows[best_ep]:.6f}", last - best_ep, key)
 EOF
 }
 
@@ -102,10 +115,14 @@ trigger() {
     exit 0
 }
 
-say "watchdog mulai (patience $PATIENCE, min relative improvement $MIN_REL_IMPROVEMENT, poll ${POLL}s, dry_run ${DRY_RUN:-0})"
+say "watchdog mulai (patience $PATIENCE, min relative improvement $MIN_REL_IMPROVEMENT, metric $METRIC, poll ${POLL}s, dry_run ${DRY_RUN:-0})"
 seen_trainer=0
 while true; do
-    read -r last best_ep best_per since <<<"$(decision)"
+    read -r last best_ep best_per since used <<<"$(decision)"
+    if [ "$used" != "$METRIC" ] && [ "${warned_metric:-}" != "$used" ]; then
+        say "metric $METRIC belum ada di $METRICS; memakai $used"
+        warned_metric=$used
+    fi
     num_epochs=$(config_value num_epochs)
     running=0
     pgrep -f "$TRAINER" >/dev/null && running=1 && seen_trainer=1
@@ -115,7 +132,7 @@ while true; do
         would_trigger=1
     fi
     if [ "${DRY_RUN:-0}" = 1 ]; then
-        say "dry run: last epoch $last of $num_epochs, best $best_per at epoch $best_ep, epochs since best $since/$PATIENCE, would_trigger $would_trigger"
+        say "dry run: metric $used, last epoch $last of $num_epochs, best $best_per at epoch $best_ep, epochs since best $since/$PATIENCE, would_trigger $would_trigger"
         exit 0
     fi
     if [ "$would_trigger" = 1 ] && [ "$running" = 1 ]; then

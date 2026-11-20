@@ -208,11 +208,13 @@ fi
 # ------------------------------------------------------------------------------
 EXPORT_DIR="$OUTPUT_DIR/export"
 echo -e "\n[4/4] Hasil export di $EXPORT_DIR:"
-ls -lh "$EXPORT_DIR"
+# --stage evalsets (skor checkpoint lama) tidak membuat export/; jangan gagal di sini
+ls -lh "$EXPORT_DIR" 2>/dev/null || echo "(tidak ada export; hasil eval set di $OUTPUT_DIR/eval_sets/)"
 echo -e "\n============================================================"
 echo "  SUKSES! Model streaming sherpa-onnx berhasil dibuat."
 echo "  Hasil test : $OUTPUT_DIR/test_results.json"
 echo "  qdat_bench : $OUTPUT_DIR/qdat_bench_test_results.json"
+echo "  Eval set   : $OUTPUT_DIR/eval_sets_results.json (dev, dev_unseen, qdat, set stres)"
 echo "============================================================"
 echo "Anda dapat mendownload model ini ke komputer lokal menggunakan scp:"
 case "$EXPORT_DIR" in

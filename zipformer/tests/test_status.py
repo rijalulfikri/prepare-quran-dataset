@@ -17,13 +17,65 @@ def _metrics(pers):
 
 
 def test_per_table_follows_the_watchdog_rule():
-    table, best, since = zs.per_table(_metrics(REAL), 0.05)
-    assert (best, since) == (16, 3)
+    table, best, since, used = zs.per_table(_metrics(REAL), 0.05)
+    assert (best, since, used) == (16, 3, "per_phonemes")
     assert [ep for ep, *_, new_best in table if new_best][-3:] == [12, 14, 16]
 
 
 def test_per_table_without_threshold_takes_any_gain():
-    assert zs.per_table(_metrics(REAL), 0.0)[1:] == (18, 1)
+    assert zs.per_table(_metrics(REAL), 0.0)[1:3] == (18, 1)
+
+
+def test_per_table_old_metrics_fall_back_to_legacy_per():
+    # a v0 dev_metrics.jsonl with the new default metric: same result as before
+    table, best, since, used = zs.per_table(_metrics(REAL), 0.05, "qdat/per_phonemes")
+    assert (best, since, used) == (16, 3, "per_phonemes")
+
+
+def test_per_table_follows_the_chosen_metric():
+    from .test_watchdog import NEW_ROWS
+
+    lines = [json.dumps(r) for r in NEW_ROWS] + ['{"epoch": 7, "qdat/per']  # torn last line
+    table, best, since, used = zs.per_table(lines, 0.05, "qdat/per_phonemes")
+    assert (best, since, used) == (6, 0, "qdat/per_phonemes")
+    ep, batch, value, sil, dev_per, new_best = table[-1]
+    assert (ep, batch, value, dev_per, new_best) == (6, 600, 0.16, 0.005, True)
+    assert zs.per_table(lines, 0.05, "dev_unseen/per_phonemes")[1:] == (2, 4, "dev_unseen/per_phonemes")
+
+
+@pytest.mark.parametrize(
+    "params, rows, expect",
+    [
+        ("patience 4, min relative improvement 0.05, metric dev_unseen/per_phonemes", "new",
+         "Metrik early stop dev_unseen/per_phonemes (rekor = < rekor x 0.95)"),
+        ("patience 4, min relative improvement 0.05", "new", "Metrik early stop qdat/per_phonemes"),
+        ("patience 4, min relative improvement 0.05", "old",
+         "Metrik early stop per_phonemes (rekor = < rekor x 0.95; qdat/per_phonemes belum ada, memakai PER dev lama)"),
+    ],
+)
+def test_print_status_shows_the_metric_in_use(monkeypatch, capsys, params, rows, expect):
+    from .test_watchdog import NEW_ROWS
+
+    lines = [json.dumps(r) for r in NEW_ROWS] if rows == "new" else _metrics(REAL)
+    sections = {"NOW": ["2026-11-20 10:00:00"], "TRAINER": ["42"], "NUM_EPOCHS": ["30"], "METRICS": lines,
+                "WATCHDOG_PARAMS": [params], "WATCHDOG": ["session", "running"]}
+    monkeypatch.setattr(zs, "find_box", lambda args: ("1.2.3.4", "22", None))
+    monkeypatch.setattr(zs, "probe", lambda args, host, port: sections)
+    monkeypatch.setattr(zs, "vast_credit", lambda: None)
+    args = type("A", (), {"patience": 4, "min_improvement": 0.05, "metric": None, "rows": 8, "drive": False})()
+    zs.print_status(args, zs.collect(args))
+    out = capsys.readouterr().out
+    assert expect in out
+    if rows == "new":
+        assert "PER eval set epoch 6: dev 0.500%, qdat/per_phonemes" not in out
+        assert "PER eval set epoch 6: dev 0.500%, qdat 16.000%, dev_unseen 1.000%" in out
+
+
+def test_eval_set_pers_names_every_set():
+    from .test_watchdog import NEW_ROWS
+
+    assert zs.eval_set_pers(NEW_ROWS[-1]) == {"dev": 0.005, "qdat": 0.16, "dev_unseen": 0.01}
+    assert zs.eval_set_pers({"epoch": 1, "per_phonemes": 0.1}) == {"dev": 0.1}
 
 
 def test_epoch_hours_averages_the_last_three_gaps():

@@ -1,0 +1,112 @@
+# Baseline of the v0 run (Drive: checkpoints/utluma-zipformer-ctc-v0, averaged epochs 28-30)
+# on the new per-epoch eval sets, WITHOUT training:
+#   python train_zipformer.py --config configs/eval_baseline_v0.yml --stage evalsets \
+#     --checkpoint utluma-edit:RClone/Utluma/zipformer-data/checkpoints/utluma-zipformer-ctc-v0-results/averaged-3.pt
+# Model dims, eval sets and early_stop_metric equal train_config.yml; augmentation is v0's
+# (unused here). Do not run --stage all/train with this file.
+
+# ---- data ----
+train_moshaf_ids:
+  - "0.0"
+  - "0.1"
+  - "0.2"
+  - "0.3"
+  - "1.0"
+  - "2.0"
+  - "2.1"
+  - "3.0"
+  - "4.0"
+  - "5.0"
+  - "6.0"
+  - "7.0"
+  - "8.0"
+  - "9.0"
+  - "11.0"
+  - "12.0"
+  - "13.0"
+  - "22.0"
+  - "24.0"
+  - "26.0"
+  - "26.1"
+  - "27.0"
+  - "28.0"
+test_moshaf_ids:
+  - "19.0"
+  - "29.0"
+  - "30.0"
+devset_ratio: 0.1              # fraction of train cuts held out as dev
+seed: 42
+max_audio_seconds: null        # drop cuts longer than this (null = keep all)
+noise_aug_ratio: 0.3           # fraction of noise cuts mixed in (data prep)
+max_noise_input_seconds: 40.0  # upper bound of noise input length
+min_noise_input_seconds: 1.0   # lower bound of noise input length
+data_dir: "./data-zipformer"
+rclone_remote_path: "utluma:RClone/Utluma/zipformer-data"
+# data_dir as tar shards, tried in order: HF, then Drive, then rclone sync of raw files (null skips a source)
+hf_data_repo: "rijalulfikri/utluma-zipformer-data"
+drive_data_shards_path: "utluma:RClone/Utluma/zipformer-shards"
+
+# ---- model (comma lists: one entry per encoder stack) ----
+num_encoder_layers: "2,2,3,4,3,2"
+downsampling_factor: "1,2,4,8,4,2"
+feedforward_dim: "512,768,1024,1536,1024,768"
+num_heads: "4,4,4,8,4,4"
+encoder_dim: "192,256,384,512,384,256"
+query_head_dim: "32"
+value_head_dim: "12"
+pos_head_dim: "4"
+pos_dim: 48
+encoder_unmasked_dim: "192,192,256,256,256,192"
+cnn_module_kernel: "31,31,15,15,15,31"
+output_downsampling_factor: 1  # 20 ms frames; deliberately differs from v3 (40 ms) for CTC blank headroom
+causal: true
+chunk_size: "8,16,24"          # chunk sizes sampled during training
+left_context_frames: "72,128,256"  # every chunk * (left // chunk) must be >= 56 (icefall assert)
+feature_dim: 80                # fbank bins
+
+# ---- training ----
+max_duration: 600              # seconds of audio per batch
+num_workers: 24                # fbank/CutMix/speed perturb run on the fly in workers; leave a few cores for the main process
+num_epochs: 30
+base_lr: 0.045
+lr_batches: 7500
+lr_epochs: 3.5
+warmup_batches: 500
+keep_last_k: 3                 # kept separately for checkpoint-*.pt and epoch-*.pt
+avg_last_k: 3                  # epochs averaged for the final model
+bf16: true
+log_every: 50
+dev_max_cuts: 2000             # cap on legacy dev cuts evaluated (null = all)
+# New run name: the v0 run (Drive folder utluma-zipformer-ctc-v0) is finished; reusing its
+# output_dir / rclone_checkpoint_path would resume from its epoch 30 and only re-average
+output_dir: "./results-zipformer-v0-baseline"
+
+# ---- augmentation (config.py defaults = the v0 pipeline: speed 0.9/1.0/1.1, CutMix 10-20 dB) ----
+speed_perturb: true
+speed_factor_ranges: [[0.9, 0.9], [1.0, 1.0], [1.1, 1.1]]
+cutmix_p: 0.5
+cutmix_snr: [10.0, 20.0]
+reverb_p: 0.0                  # simulated-RIR reverb on the speech, before the noise mix
+volume_p: 0.0                  # gain uniform in dB, after the noise mix (quiet microphone)
+volume_db: [-30.0, 6.0]
+
+# ---- per-epoch eval sets (one dev_metrics.jsonl row per epoch, see README) ----
+dev_unseen_cuts_per_moshaf: 1000   # fixed sample of cuts_test (moshaf 19.0, 29.0, 30.0)
+eval_qdat: true                # obadx/qdat_bench, 159 phone clips, eval only
+stress_sets: ["vol-20db", "reverb", "speed1.25"]   # perturbed copies of the dev_unseen sample
+early_stop_metric: "qdat/per_phonemes"   # key the watchdog's new-best rule follows
+
+# ---- eval / export ----
+export_chunk_size: 24          # must be one of chunk_size
+export_left_context: 256
+hub_model_id: "rijalulfikri/utluma-zipformer-ctc-v0-baseline"
+wandb_project_name: "utluma-zipformer-ctc-v0-baseline"
+
+# ---- frame budget ----
+max_dropped_fraction: 0.01     # abort train if more speech cuts fail the CTC frame check
+
+# ---- fault tolerance ----
+save_every_n_batches: 2000
+rclone_checkpoint_path: "utluma-edit:RClone/Utluma/zipformer-data/checkpoints/utluma-zipformer-ctc-v0-baseline"  # null disables Drive backup
+upload_timeout_seconds: 1800
+shutdown_flush_seconds: 120

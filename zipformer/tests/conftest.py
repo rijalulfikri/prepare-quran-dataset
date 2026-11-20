@@ -15,6 +15,22 @@ os.environ["PYTHONPATH"] = os.pathsep.join(
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_wandb(monkeypatch):
+    """Keep every test, and every subprocess it starts, off W&B.
+
+    `main()` of train_loop / train_zipformer calls `load_dotenv()`, which finds
+    `zipformer/.env` by walking up from the module file (not the cwd) and fills
+    in any variable *absent* from the environment, WANDB_API_KEY included.
+    Deleting the key therefore lets the real one back in; an empty value is
+    kept (python-dotenv's default `override=False`) and `make_logger` treats it
+    as unset. WANDB_MODE=disabled backs that up should anything still call
+    `wandb.init`. Subprocesses inherit both through `os.environ`.
+    """
+    monkeypatch.setenv("WANDB_API_KEY", "")
+    monkeypatch.setenv("WANDB_MODE", "disabled")
+
+
 @pytest.fixture
 def moshaf_6_0_dict():
     """Fresh copy of a real `moshaf_metadata` row (moshaf 6.0) of
@@ -181,6 +197,62 @@ def _build_data_dir(root, num_speech, seconds, speech_specs=None):
     _write_cuts(train, root / "cuts_dev.jsonl.gz")
     _write_cuts(noise_aug, root / "cuts_noise_aug.jsonl.gz")
     return root
+
+
+TEST_MOSHAF_SIZES = {"19.0": 7, "29.0": 3, "30.0": 5}
+
+
+def _add_test_split(root, sizes=TEST_MOSHAF_SIZES):
+    """`cuts_test.jsonl.gz`: two-second speech cuts of several held-out moshafs,
+    with `moshaf_id` in the supervision custom fields (as data prep writes it)."""
+    import io
+
+    import numpy as np
+    import soundfile as sf
+
+    from quran_zipformer.data_prep import _write_cuts, make_cut, write_flac
+
+    rng = np.random.default_rng(1)
+    cuts = []
+    for moshaf, n in sizes.items():
+        for seg in range(n):
+            rel = f"audio/moshaf_{moshaf}/{seg}.flac"
+            t = np.arange(32000) / 16000
+            buf = io.BytesIO()
+            sf.write(buf, (0.1 * np.sin(2 * np.pi * rng.uniform(100, 400) * t)).astype("float32"), 16000, format="WAV")
+            duration = write_flac(buf.getvalue(), root / rel)
+            custom = {"moshaf_id": moshaf, "segment_index": str(seg), "input_type": "speech"}
+            cuts.append(make_cut(rel, duration, "ءَلِف"[: 1 + seg % 4], f"moshaf_{moshaf}__{seg}", custom, root))
+    _write_cuts(cuts, root / "cuts_test.jsonl.gz")
+    return root
+
+
+@pytest.fixture(scope="session")
+def tiny_data_dir_eval(tmp_path_factory):
+    """`tiny_data_dir`'s layout plus a test split of 7 + 3 + 5 cuts (moshaf 19.0, 29.0, 30.0)."""
+    root = _build_data_dir(tmp_path_factory.mktemp("tiny_data_eval"), num_speech=3, seconds=3)
+    return _add_test_split(root)
+
+
+@pytest.fixture
+def fake_qdat(monkeypatch):
+    """Two qdat_bench-shaped rows (WAV bytes at 22.05 kHz, spaced transcript) instead of the HF download."""
+    import io
+
+    import numpy as np
+    import soundfile as sf
+
+    from quran_zipformer import eval_sets
+
+    def row(i):
+        buf = io.BytesIO()
+        sf.write(buf, (0.1 * np.sin(np.arange(44100) / 10)).astype("float32"), 22050, format="WAV")
+        return {"id": f"q{i}", "audio": {"bytes": buf.getvalue(), "path": f"s{i}.wav"},
+                "phonetic_transcript": "ءَ لِ\nف", "gender": "female"}
+
+    rows = [row(0), row(1)]
+    monkeypatch.setattr(eval_sets, "_load_qdat_rows", lambda: rows)
+    return rows
 
 
 @pytest.fixture(scope="session")

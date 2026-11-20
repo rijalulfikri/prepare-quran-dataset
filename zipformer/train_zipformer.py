@@ -4,6 +4,10 @@ Every stage is idempotent, so re-running the same command after a crash or on a
 new box continues where the last run stopped (training auto-resumes from local
 or Drive checkpoints; eval / qdat_bench skip results that already exist).
 
+`--stage evalsets --checkpoint <path or rclone remote:path> [...]` runs prepare,
+then scores existing checkpoints on every per-epoch eval set of the config
+(no training), one `<output_dir>/eval_sets/<checkpoint>.json` each.
+
 Exit codes: 0 success, 143 graceful stop (`TrainingInterrupted`, e.g. SIGTERM;
 checkpoints flushed), 1 any other failure.
 """
@@ -26,6 +30,7 @@ DEFAULT_CONFIG = "configs/train_config.yml"
 STAGES = ["prepare", "train", "eval", "export"]
 EXIT_INTERRUPTED = 143
 N_PARITY_WAVS = 5
+EVAL_SETS_RESULTS = "eval_sets_results.json"
 
 
 class RcloneSetupError(RuntimeError):
@@ -35,7 +40,11 @@ class RcloneSetupError(RuntimeError):
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="python train_zipformer.py", description=__doc__.splitlines()[0])
     p.add_argument("--config", default=DEFAULT_CONFIG, help=f"training YAML (default: {DEFAULT_CONFIG})")
-    p.add_argument("--stage", choices=[*STAGES, "all"], default="all")
+    p.add_argument("--stage", choices=[*STAGES, "all", "evalsets"], default="all")
+    p.add_argument(
+        "--checkpoint", action="append", default=[], metavar="PATH",
+        help="--stage evalsets: checkpoint to score (local path or rclone remote:path); repeatable",
+    )
     p.add_argument(
         "--push-to-hub", action="store_true", help="upload export/, averaged .pt, config and results to hub_model_id"
     )
@@ -46,6 +55,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def stages_to_run(stage: str) -> list[str]:
+    if stage == "evalsets":
+        return ["prepare", "evalsets"]  # prepare is a no-op when the shards are already there
     return list(STAGES) if stage == "all" else [stage]
 
 
@@ -141,19 +152,76 @@ def stage_train(cfg, args: argparse.Namespace) -> Path:
 
 
 def stage_eval(cfg, args: argparse.Namespace) -> None:
+    """Averaged model on the full test split (test_results.json) and on the
+    per-epoch eval sets (eval_sets_results.json, the dev_metrics.jsonl keys)."""
     out = Path(cfg.output_dir) / "test_results.json"
-    if out.exists() and not args.rerun_testset:
-        log.info("%s exists; skipping test eval (use --rerun-testset)", out)
+    sets_out = Path(cfg.output_dir) / EVAL_SETS_RESULTS
+    todo = [p for p in (out, sets_out) if args.rerun_testset or not p.exists()]
+    if not todo:
+        log.info("%s and %s exist; skipping eval (use --rerun-testset)", out, sets_out)
         return
     from quran_zipformer.datamodule import eval_dataloader, load_cuts
     from quran_zipformer.decode import evaluate_split
+    from quran_zipformer.train_loop import evaluate_sets, standalone_eval_sets
 
     tokens, device = _tokens(), _device(args)
     model = _load_averaged_model(cfg, tokens).to(device)
-    loader = eval_dataloader(cfg, load_cuts(Path(cfg.data_dir), "test"))
-    results = evaluate_split(model, loader, tokens, device, cfg.export_chunk_size, cfg.export_left_context)
-    out.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
-    log.info("test results -> %s: %s", out, results)
+    if out in todo:
+        loader = eval_dataloader(cfg, load_cuts(Path(cfg.data_dir), "test"))
+        results = evaluate_split(model, loader, tokens, device, cfg.export_chunk_size, cfg.export_left_context)
+        out.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
+        log.info("test results -> %s: %s", out, results)
+    if sets_out in todo:
+        metrics = evaluate_sets(model, cfg, standalone_eval_sets(cfg, Path(cfg.data_dir), tokens), tokens, device)
+        row = {"checkpoint": _averaged_path(cfg).name, **metrics}
+        sets_out.write_text(json.dumps(row, indent=2, ensure_ascii=False), encoding="utf-8")
+        log.info("eval-set results -> %s: %s", sets_out, metrics)
+
+
+def _local_checkpoint(src: str, cache_dir: Path) -> Path:
+    """`src` itself if it is a local file, else `rclone copyto` of `remote:path` into `cache_dir`."""
+    if Path(src).is_file():
+        return Path(src)
+    if ":" not in src:
+        raise FileNotFoundError(f"checkpoint {src} is neither a local file nor an rclone remote:path")
+    dest = cache_dir / Path(src.split(":", 1)[1]).name
+    if not dest.exists():
+        check_rclone()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(dest.name + ".part")
+        log.info("downloading %s -> %s", src, dest)
+        subprocess.run(["rclone", "copyto", src, str(tmp)], check=True)
+        tmp.rename(dest)
+    return dest
+
+
+def stage_evalsets(cfg, args: argparse.Namespace) -> list[Path]:
+    """Score each `--checkpoint` (epoch-*.pt, checkpoint-*.pt or averaged-*.pt) on
+    the config's eval sets, without training: `<output_dir>/eval_sets/<name>.json`."""
+    if not args.checkpoint:
+        raise ValueError("--stage evalsets needs at least one --checkpoint")
+    import torch
+
+    from quran_zipformer.model import build_model
+    from quran_zipformer.train_loop import evaluate_sets, standalone_eval_sets
+
+    tokens, device = _tokens(), _device(args)
+    out_dir = Path(cfg.output_dir) / "eval_sets"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sets = standalone_eval_sets(cfg, Path(cfg.data_dir), tokens)
+    written = []
+    for src in args.checkpoint:
+        pt = _local_checkpoint(src, out_dir / "checkpoints")
+        ckpt = torch.load(pt, map_location="cpu", weights_only=False)
+        model = build_model(cfg, tokens.vocab_size)
+        model.load_state_dict(ckpt["model"])
+        metrics = evaluate_sets(model.to(device), cfg, sets, tokens, device)
+        row = {"checkpoint": src, "epoch": ckpt.get("epoch"), "averaged_from": ckpt.get("averaged_from"), **metrics}
+        path = out_dir / f"{pt.stem}.json"
+        path.write_text(json.dumps(row, indent=2, ensure_ascii=False), encoding="utf-8")
+        log.info("%s -> %s: %s", src, path, metrics)
+        written.append(path)
+    return written
 
 
 def _parity_wavs(cfg) -> list:
@@ -226,6 +294,7 @@ def push_to_hub(cfg) -> None:
         output_dir / "config.yml",
         output_dir / "test_results.json",
         output_dir / "qdat_bench_test_results.json",
+        output_dir / EVAL_SETS_RESULTS,
     ]
     for path in files:
         if not path.exists():
@@ -248,7 +317,10 @@ def main(argv: list[str] | None = None) -> int:
     from quran_zipformer.train_loop import TrainingInterrupted
 
     cfg = ZipformerTrainConfig.from_yaml(args.config)
-    runners = {"prepare": stage_prepare, "train": stage_train, "eval": stage_eval, "export": stage_export}
+    runners = {
+        "prepare": stage_prepare, "train": stage_train, "eval": stage_eval, "export": stage_export,
+        "evalsets": stage_evalsets,
+    }
     try:
         for name in stages_to_run(args.stage):
             log.info("===== stage: %s =====", name)

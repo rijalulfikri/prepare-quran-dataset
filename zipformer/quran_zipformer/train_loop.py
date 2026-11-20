@@ -40,10 +40,13 @@ from quran_zipformer.datamodule import (
     batch_to_tensors,
     eval_dataloader,
     load_cuts,
+    speed_copies,
+    speed_ranges,
     train_dataloader,
 )
 from quran_zipformer.decode import evaluate_split
 from quran_zipformer.drive_backup import DriveBackup
+from quran_zipformer.eval_sets import LEGACY_DEV, build_eval_sets, metric_keys
 from quran_zipformer.icefall_import import setup_icefall_paths
 from quran_zipformer.model import build_model
 from quran_zipformer.tokens import PhonemeTokens
@@ -278,33 +281,38 @@ def _age(pt: Path) -> str:
 
 
 def apply_frame_budget(cfg: ZipformerTrainConfig, data_dir: Path) -> tuple[CutSet, CutSet]:
-    """Drop CTC-infeasible speech cuts from train and dev; abort if too many.
+    """Check the CTC frame budget of train (per speed copy) and dev; abort if too many fail.
 
-    Deterministic for the same data and config, so a resume rebuilds the same cuts.
+    Returns `(train cuts, feasible dev cuts)`. Train cuts come back whole: the
+    infeasible speed copies are left out where the copies are built
+    (`datamodule.speed_copies`, the same rule as counted here), so a cut too
+    short only at its fastest factor keeps its slower copies. Dev is not speed
+    perturbed and is checked at 1.0. Deterministic for the same data and config,
+    so a resume rebuilds the same cuts.
     """
-    speed = 1.1 if cfg.speed_perturb else 1.0
     factor = cfg.output_downsampling_factor
-    raw = {split: load_cuts(data_dir, split) for split in ("train", "dev")}
-    kept, dropped = {}, {}
-    for split, cuts in raw.items():
-        kept[split], dropped[split] = fb.filter_feasible(cuts, factor, speed)
+    train, raw_dev = load_cuts(data_dir, "train"), load_cuts(data_dir, "dev")
+    _, dropped_train = speed_copies(cfg, train)
+    dev, dropped_dev = fb.filter_feasible(raw_dev, factor, 1.0)
     out = Path(cfg.output_dir)
     out.mkdir(parents=True, exist_ok=True)
+    ranges = speed_ranges(cfg)
     (out / "dropped_cuts.json").write_text(
-        json.dumps({"factor": factor, "speed": speed, "train": dropped["train"], "dev": dropped["dev"]}, indent=2)
+        json.dumps({"factor": factor, "speed_factor_ranges": ranges, "train": dropped_train, "dev": dropped_dev}, indent=2)
     )
-    num_speech = sum(not fb._is_silence(c) for cuts in raw.values() for c in cuts)
-    num_dropped = len(dropped["train"]) + len(dropped["dev"])
+    num_copies = len(ranges) * sum(not fb._is_silence(c) for c in train)
+    num_dev = sum(not fb._is_silence(c) for c in raw_dev)
+    num_speech, num_dropped = num_copies + num_dev, len(dropped_train) + len(dropped_dev)
     fraction = num_dropped / num_speech if num_speech else 0.0
-    log.info("frame budget (factor %d, speed %.1f): dropped %d train + %d dev of %d speech cuts",
-             factor, speed, len(dropped["train"]), len(dropped["dev"]), num_speech)
+    log.info("frame budget (factor %d, speed ranges %s): dropped %d of %d train speech copies + %d of %d dev cuts",
+             factor, ranges, len(dropped_train), num_copies, len(dropped_dev), num_dev)
     if fraction > cfg.max_dropped_fraction:
         raise FrameBudgetError(
-            f"{num_dropped}/{num_speech} speech cuts ({fraction:.2%}) are too short for their labels at "
-            f"output_downsampling_factor={factor}, speed {speed} (max_dropped_fraction="
+            f"{num_dropped}/{num_speech} speech cuts / copies ({fraction:.2%}) are too short for their labels at "
+            f"output_downsampling_factor={factor}, speed ranges {ranges} (max_dropped_fraction="
             f"{cfg.max_dropped_fraction}); see {out / 'dropped_cuts.json'}"
         )
-    return kept["train"], kept["dev"]
+    return train, dev
 
 
 # ------------------------------------------------------------------ logging
@@ -516,12 +524,33 @@ def _evaluated_epochs(out: Path) -> set[int]:
     return epochs
 
 
-def _dev_eval(model, cfg, dev_cuts: CutSet, tokens, device, epoch: int, batch_idx_train: int, logger) -> dict:
-    loader = eval_dataloader(cfg, dev_cuts)
-    try:
-        metrics = evaluate_split(model, loader, tokens, device, cfg.export_chunk_size, cfg.export_left_context, cfg.dev_max_cuts)
-    finally:
-        _close_loader(loader)
+def evaluate_sets(model, cfg, eval_sets: dict[str, CutSet], tokens, device) -> dict:
+    """Metrics of every set in one flat dict (see `eval_sets.metric_keys`), each
+    decoded with the export chunk / left context; the legacy dev is capped at `dev_max_cuts`."""
+    metrics = {}
+    for name, cuts in eval_sets.items():
+        loader = eval_dataloader(cfg, cuts)
+        try:
+            m = evaluate_split(
+                model, loader, tokens, device, cfg.export_chunk_size, cfg.export_left_context,
+                cfg.dev_max_cuts if name == LEGACY_DEV else None,
+            )
+        finally:
+            _close_loader(loader)
+        metrics.update(metric_keys(name, m))
+    return metrics
+
+
+def standalone_eval_sets(cfg: ZipformerTrainConfig, data_dir: Path, tokens: PhonemeTokens) -> dict[str, CutSet]:
+    """The per-epoch eval sets for a model evaluated outside training (final
+    model, old checkpoints), with the dev split filtered as `apply_frame_budget` does."""
+    dev, _ = fb.filter_feasible(load_cuts(data_dir, "dev"), cfg.output_downsampling_factor, 1.0)
+    return build_eval_sets(cfg, data_dir, dev, tokens)
+
+
+def _dev_eval(model, cfg, eval_sets: dict[str, CutSet], tokens, device, epoch: int, batch_idx_train: int, logger) -> dict:
+    """Evaluate every set and append one row to dev_metrics.jsonl."""
+    metrics = evaluate_sets(model, cfg, eval_sets, tokens, device)
     row = {"epoch": epoch, "batch_idx_train": batch_idx_train, **metrics}
     path = Path(cfg.output_dir) / DEV_METRICS
     # a crash mid-append can leave a line without "\n"; never glue a new row onto it
@@ -529,11 +558,12 @@ def _dev_eval(model, cfg, dev_cuts: CutSet, tokens, device, epoch: int, batch_id
     with open(path, "a", encoding="utf-8") as f:
         f.write(("\n" if torn else "") + json.dumps(row) + "\n")
     log.info("dev epoch %d: %s", epoch, metrics)
-    logger.log({f"dev/{k}": v for k, v in metrics.items()}, batch_idx_train)
+    # legacy dev keys stay under dev/; the other sets go under eval/<set>/
+    logger.log({(f"eval/{k}" if "/" in k else f"dev/{k}"): v for k, v in metrics.items()}, batch_idx_train)
     return row
 
 
-def _dev_eval_missing(cfg, dev_cuts: CutSet, tokens, device, before_epoch: int, logger) -> None:
+def _dev_eval_missing(cfg, eval_sets: dict[str, CutSet], tokens, device, before_epoch: int, logger) -> None:
     """Dev-evaluate finished epochs (< `before_epoch`) absent from dev_metrics.jsonl."""
     out = Path(cfg.output_dir)
     done = _evaluated_epochs(out)
@@ -547,7 +577,7 @@ def _dev_eval_missing(cfg, dev_cuts: CutSet, tokens, device, before_epoch: int, 
         ckpt = _load(pt)
         model = build_model(cfg, tokens.vocab_size)
         model.load_state_dict(ckpt["model"])
-        _dev_eval(model.to(device), cfg, dev_cuts, tokens, device, epoch, int(ckpt["batch_idx_train"]), logger)
+        _dev_eval(model.to(device), cfg, eval_sets, tokens, device, epoch, int(ckpt["batch_idx_train"]), logger)
 
 
 def backup_health(backup: DriveBackup) -> str:
@@ -556,11 +586,11 @@ def backup_health(backup: DriveBackup) -> str:
     return f"backup: FAILING ({backup.consecutive_failures} consecutive, last error {backup.last_error})"
 
 
-def _finish_epoch(model, opt, sched, st: TrainState, cfg, backup, dev_cuts, tokens, device, logger) -> None:
+def _finish_epoch(model, opt, sched, st: TrainState, cfg, backup, eval_sets, tokens, device, logger) -> None:
     """Save the epoch checkpoint, dev-evaluate, advance `st` to the next epoch."""
     _check_finite_weights(model, st)
     save_and_backup(make_checkpoint(model, opt, sched, st, None, cfg), "epoch", cfg, backup)
-    _dev_eval(model, cfg, dev_cuts, tokens, device, st.epoch, st.batch_idx_train, logger)
+    _dev_eval(model, cfg, eval_sets, tokens, device, st.epoch, st.batch_idx_train, logger)
     if backup is not None:
         health = backup_health(backup)
         (log.info if backup.consecutive_failures == 0 else log.warning)("epoch %d finished; %s", st.epoch, health)
@@ -589,28 +619,29 @@ def average_last_epochs(output_dir: Path, k: int) -> Path:
 
 
 def _setup(cfg: ZipformerTrainConfig, data_dir: Path, tokens: PhonemeTokens, device):
-    """Shared start: config.yml, backup, resume source, frame budget, model, restore."""
+    """Shared start: config.yml, backup, resume source, frame budget, eval sets, model, restore."""
     out = Path(cfg.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     cfg.to_yaml(out / "config.yml")
     backup = make_backup(cfg)
     resume_pt = resolve_resume(cfg, backup)
     train_cuts, dev_cuts = apply_frame_budget(cfg, data_dir)
+    eval_sets = build_eval_sets(cfg, data_dir, dev_cuts, tokens)
     model = build_model(cfg, tokens.vocab_size).to(device)
     opt, sched = build_optimizer(model, cfg)
     st = TrainState()
     if resume_pt is not None:
         st = restore(model, opt, sched, _load(resume_pt), cfg=cfg)
-    return backup, train_cuts, dev_cuts, model, opt, sched, st
+    return backup, train_cuts, eval_sets, model, opt, sched, st
 
 
 def run_training(cfg: ZipformerTrainConfig, data_dir: Path, tokens: PhonemeTokens, device) -> Path:
     """Train (resuming if possible) for `cfg.num_epochs`; return the averaged checkpoint."""
-    backup, train_cuts, dev_cuts, model, opt, sched, st = _setup(cfg, data_dir, tokens, device)
+    backup, train_cuts, eval_sets, model, opt, sched, st = _setup(cfg, data_dir, tokens, device)
     out = Path(cfg.output_dir)
     logger, st.wandb_run_id = make_logger(cfg, st.wandb_run_id)
     try:
-        _dev_eval_missing(cfg, dev_cuts, tokens, device, min(st.epoch, cfg.num_epochs + 1), logger)
+        _dev_eval_missing(cfg, eval_sets, tokens, device, min(st.epoch, cfg.num_epochs + 1), logger)
         if st.epoch <= cfg.num_epochs:
             stop_flag = threading.Event()
             install_signal_handlers(stop_flag)
@@ -621,7 +652,7 @@ def run_training(cfg: ZipformerTrainConfig, data_dir: Path, tokens: PhonemeToken
                 )
                 st = train_one_epoch(model, opt, sched, loader, st, cfg, tokens, device, logger, backup, stop_flag)
                 del loader
-                _finish_epoch(model, opt, sched, st, cfg, backup, dev_cuts, tokens, device, logger)
+                _finish_epoch(model, opt, sched, st, cfg, backup, eval_sets, tokens, device, logger)
                 if stop_flag.is_set():  # e.g. SIGTERM during dev eval; epoch ckpt already saved
                     if backup is not None and not backup.flush(cfg.shutdown_flush_seconds):
                         log.warning("Drive upload not finished within %ss", cfg.shutdown_flush_seconds)
@@ -652,7 +683,7 @@ def run_steps_for_test(cfg: ZipformerTrainConfig, data_dir: Path, tokens: Phonem
     No signal handlers, no W&B / TensorBoard.
     """
     device = torch.device("cpu")
-    backup, train_cuts, dev_cuts, model, opt, sched, st = _setup(cfg, data_dir, tokens, device)
+    backup, train_cuts, eval_sets, model, opt, sched, st = _setup(cfg, data_dir, tokens, device)
     snap = {
         "batch_idx_train": st.batch_idx_train,
         "lrs": _lrs(opt),
@@ -681,7 +712,7 @@ def run_steps_for_test(cfg: ZipformerTrainConfig, data_dir: Path, tokens: Phonem
         )
         del loader
         if finished:
-            _finish_epoch(model, opt, sched, st, cfg, backup, dev_cuts, tokens, device, logger)
+            _finish_epoch(model, opt, sched, st, cfg, backup, eval_sets, tokens, device, logger)
     if backup is not None:
         backup.flush(cfg.upload_timeout_seconds)
     return {

@@ -71,23 +71,40 @@ keep_last_k: 3                 # kept separately for checkpoint-*.pt and epoch-*
 avg_last_k: 3                  # epochs averaged for the final model
 bf16: true
 log_every: 50
-dev_max_cuts: 2000             # cap on dev cuts evaluated (null = all)
-cutmix_p: 0.5
-cutmix_snr: [10.0, 20.0]
+dev_max_cuts: 2000             # cap on legacy dev cuts evaluated (null = all)
+# New run name: the v0 run (Drive folder utluma-zipformer-ctc-v0) is finished; reusing its
+# output_dir / rclone_checkpoint_path would resume from its epoch 30 and only re-average
+output_dir: "./results-zipformer-v1"
+
+# ---- augmentation (config.py defaults = the v0 pipeline: speed 0.9/1.0/1.1, CutMix 10-20 dB) ----
 speed_perturb: true
-output_dir: "./results-zipformer-v0"
+speed_factor_ranges:           # one static copy per range; factor drawn per cut on a 0.05 grid
+  - [0.85, 0.95]
+  - [1.0, 1.0]
+  - [1.05, 1.25]
+cutmix_p: 0.5
+cutmix_snr: [5.0, 20.0]        # v0: [10, 20]
+reverb_p: 0.3                  # simulated-RIR reverb on the speech, before the noise mix
+volume_p: 0.5                  # gain uniform in dB, after the noise mix (quiet microphone)
+volume_db: [-30.0, 6.0]
+
+# ---- per-epoch eval sets (one dev_metrics.jsonl row per epoch, see README) ----
+dev_unseen_cuts_per_moshaf: 1000   # fixed sample of cuts_test (moshaf 19.0, 29.0, 30.0)
+eval_qdat: true                # obadx/qdat_bench, 159 phone clips, eval only
+stress_sets: ["vol-20db", "reverb", "speed1.25"]   # perturbed copies of the dev_unseen sample
+early_stop_metric: "qdat/per_phonemes"   # key the watchdog's new-best rule follows
 
 # ---- eval / export ----
 export_chunk_size: 24          # must be one of chunk_size
 export_left_context: 256
-hub_model_id: "rijalulfikri/utluma-zipformer-ctc-v0"
-wandb_project_name: "utluma-zipformer-ctc-v0"
+hub_model_id: "rijalulfikri/utluma-zipformer-ctc-v1"
+wandb_project_name: "utluma-zipformer-ctc-v1"
 
 # ---- frame budget ----
 max_dropped_fraction: 0.01     # abort train if more speech cuts fail the CTC frame check
 
 # ---- fault tolerance ----
 save_every_n_batches: 2000
-rclone_checkpoint_path: "utluma-edit:RClone/Utluma/zipformer-data/checkpoints/utluma-zipformer-ctc-v0"  # null disables Drive backup
+rclone_checkpoint_path: "utluma-edit:RClone/Utluma/zipformer-data/checkpoints/utluma-zipformer-ctc-v1"  # null disables Drive backup
 upload_timeout_seconds: 1800
 shutdown_flush_seconds: 120

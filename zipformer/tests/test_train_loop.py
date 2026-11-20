@@ -19,11 +19,7 @@ from quran_zipformer.datamodule import train_dataloader  # noqa: E402
 from quran_zipformer.model import build_model  # noqa: E402
 
 CPU = torch.device("cpu")
-
-
-@pytest.fixture(autouse=True)
-def _no_wandb(monkeypatch):
-    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+# W&B stays off through conftest's autouse `_no_wandb` (empty key, WANDB_MODE=disabled)
 
 
 def test_encode_targets_handles_empty(tokens):
@@ -87,8 +83,11 @@ def test_frame_budget_abort(tiny_cfg, tiny_data_dir_infeasible, tokens):
     with pytest.raises(tl.FrameBudgetError):
         tl.run_training(tiny_cfg, tiny_data_dir_infeasible, tokens, CPU)
     dropped = json.loads((Path(tiny_cfg.output_dir) / "dropped_cuts.json").read_text())
-    assert dropped["factor"] == 1 and dropped["speed"] == 1.1
-    assert sorted(dropped["train"]) == sorted(dropped["dev"]) == ["moshaf_6.0__8", "moshaf_6.0__9"]
+    assert dropped["factor"] == 1 and dropped["speed_factor_ranges"] == [[0.9, 0.9], [1.0, 1.0], [1.1, 1.1]]
+    # train is checked per speed copy (all three copies fail here), dev at 1.0
+    bad = ["moshaf_6.0__8", "moshaf_6.0__9"]
+    assert sorted(dropped["train"]) == sorted(f"{c}{s}" for c in bad for s in ("_sp0.9", "", "_sp1.1"))
+    assert sorted(dropped["dev"]) == bad
     assert not list(ck.list_complete(tiny_cfg.output_dir))
 
 
@@ -327,7 +326,9 @@ def test_signal_to_process_group_stops_gracefully(tmp_path, tiny_cfg, tiny_data_
     tiny_cfg.save_every_n_batches = 2
     tiny_cfg.to_yaml(tmp_path / "cfg.yml")
     out = Path(tiny_cfg.output_dir)
-    env = {k: v for k, v in os.environ.items() if k != "WANDB_API_KEY"}
+    # inherit the conftest W&B guard: dropping WANDB_API_KEY here would let
+    # load_dotenv() fill in the real key from zipformer/.env
+    env = dict(os.environ)
     cmd = [sys.executable, "-m", "quran_zipformer.train_loop", "--config", str(tmp_path / "cfg.yml"),
            "--data-dir", str(tiny_data_dir_big), "--device", "cpu"]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -373,3 +374,55 @@ def test_finish_epoch_logs_backup_health(monkeypatch, caplog):
     assert "epoch 2 finished; backup: FAILING (3 consecutive, last error quota exceeded)" in caplog.text
     assert "epoch 3 finished" not in caplog.text  # no backup configured -> no health line
     assert st.epoch == 4
+
+
+# ---------------------------------------------------------------- eval sets (v1)
+
+
+EVAL_SETS_CFG = dict(dev_unseen_cuts_per_moshaf=2, eval_qdat=True, stress_sets=["vol-20db", "reverb", "speed1.25"])
+
+
+def test_dev_metrics_row_has_every_eval_set(tiny_cfg, tiny_data_dir_eval, tokens, fake_qdat, tmp_path):
+    import shutil
+
+    data = tmp_path / "data"
+    shutil.copytree(tiny_data_dir_eval, data)
+    cfg = tiny_cfg.model_copy(update=EVAL_SETS_CFG)
+    out = Path(cfg.output_dir)
+    tl.run_training(cfg, data, tokens, CPU)
+    rows = [json.loads(x) for x in (out / "dev_metrics.jsonl").read_text().splitlines()]
+    assert [r["epoch"] for r in rows] == [1]
+    row = rows[0]
+    # legacy dev keys unchanged (old readers keep working)
+    assert {"epoch", "batch_idx_train", "per_phonemes", "silence_per", "num_speech", "num_silence"} <= set(row)
+    sets = ["dev_unseen", "dev_unseen_vol-20db", "dev_unseen_reverb", "dev_unseen_speed1.25", "qdat"]
+    for name in sets:
+        assert 0 <= row[f"{name}/per_phonemes"] <= 1
+    assert [row[f"{n}/num_speech"] for n in sets] == [6, 6, 6, 6, 2]
+    assert set(row) == {"epoch", "batch_idx_train", "per_phonemes", "silence_per", "num_speech", "num_silence",
+                        *(f"{n}/{k}" for n in sets for k in ("per_phonemes", "num_speech"))}
+
+
+def test_legacy_dev_metrics_rows_still_count_as_evaluated(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "dev_metrics.jsonl").write_text(
+        '{"epoch": 1, "batch_idx_train": 10, "per_phonemes": 0.5, "silence_per": null, "num_speech": 3, "num_silence": 1}\n'
+        '{"epoch": 2, "batch_idx_train": 20, "per_phonemes": 0.4, "qdat/per_phonemes": 0.2}\n'
+    )
+    assert tl._evaluated_epochs(out) == {1, 2}
+
+
+def test_evaluate_sets_caps_only_the_legacy_dev(monkeypatch, tiny_cfg):
+    calls = []
+
+    def fake_split(model, loader, tokens, device, chunk, left, max_cuts=None):
+        calls.append(max_cuts)
+        return {"per_phonemes": 0.1, "silence_per": None, "num_speech": 1, "num_silence": 0}
+
+    monkeypatch.setattr(tl, "evaluate_split", fake_split)
+    monkeypatch.setattr(tl, "eval_dataloader", lambda cfg, cuts: object())
+    m = tl.evaluate_sets(None, tiny_cfg, {"dev": None, "qdat": None}, None, CPU)
+    assert calls == [tiny_cfg.dev_max_cuts, None]
+    assert m == {"per_phonemes": 0.1, "silence_per": None, "num_speech": 1, "num_silence": 0,
+                 "qdat/per_phonemes": 0.1, "qdat/num_speech": 1}

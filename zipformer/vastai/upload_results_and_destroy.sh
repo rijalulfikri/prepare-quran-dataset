@@ -60,7 +60,8 @@ if [[ -z "${RESULTS_REMOTE:-}" ]]; then
 fi
 
 # Checkpoint sudah ada di rclone_checkpoint_path; averaged-*.pt, export/, tb/, dll. ikut
-EXCLUDES=(--exclude "checkpoint-*" --exclude "epoch-*")
+# eval_sets/checkpoints/: salinan checkpoint lama yang diunduh --stage evalsets (sudah ada di Drive)
+EXCLUDES=(--exclude "checkpoint-*" --exclude "epoch-*" --exclude "/eval_sets/checkpoints/**")
 echo "Upload $OUTPUT_DIR -> $RESULTS_REMOTE ..."
 rclone copy "$OUTPUT_DIR" "$RESULTS_REMOTE" "${EXCLUDES[@]}" --transfers 8 --stats 30s --stats-one-line
 echo "Verifikasi upload (rclone check)..."

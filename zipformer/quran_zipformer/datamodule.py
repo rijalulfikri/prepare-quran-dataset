@@ -1,5 +1,6 @@
-"""Lhotse DataLoaders for Zipformer2-CTC: on-the-fly fbank, CutMix noise, 3x speed
-perturbation and a bucketing sampler that resumes at the exact consumed batch.
+"""Lhotse DataLoaders for Zipformer2-CTC: on-the-fly fbank, static speed-perturbed
+copies, optional reverb, CutMix noise, optional dB gain, SpecAugment, and a
+bucketing sampler that resumes at the exact consumed batch.
 
 Manifests are Task 4's `cuts_<split>.jsonl.gz` under `data_dir`, whose recording
 paths are relative to `data_dir`.
@@ -23,11 +24,13 @@ from lhotse.dataset import (
     OnTheFlyFeatures,
     SpecAugment,
 )
+from lhotse.dataset.dataloading import resolve_seed
 from lhotse.dataset.dataloading import worker_init_fn as lhotse_worker_init_fn
 from torch import Tensor
 from torch.utils.data import DataLoader
 
-from quran_zipformer.config import ZipformerTrainConfig
+from quran_zipformer import frame_budget as fb
+from quran_zipformer.config import SPEED_STEP, ZipformerTrainConfig
 
 Split = Literal["train", "dev", "test", "noise_aug"]
 
@@ -42,21 +45,67 @@ def load_cuts(data_dir: Path, split: Split) -> CutSet:
     return cuts.with_recording_path_prefix(str(data_dir))
 
 
+def speed_ranges(cfg: ZipformerTrainConfig) -> list[tuple[float, float]]:
+    """One `(low, high)` per static copy of a train cut; `[(1, 1)]` without speed perturbation."""
+    return [tuple(r) for r in cfg.speed_factor_ranges] if cfg.speed_perturb else [(1.0, 1.0)]
+
+
+def _grid(low: float, high: float) -> list[float]:
+    n = round((high - low) / SPEED_STEP)
+    return [round(low + i * SPEED_STEP, 2) for i in range(n + 1)]
+
+
+def copy_factors(cfg: ZipformerTrainConfig, cut_id: str) -> list[float]:
+    """Speed factor of each copy of `cut_id`, one per range.
+
+    Drawn from a string seed of (`cfg.seed`, cut id, range index), so it is the
+    same in every process, epoch and resume, and does not depend on cut order.
+    """
+    out = []
+    for i, (low, high) in enumerate(speed_ranges(cfg)):
+        grid = _grid(low, high)
+        out.append(grid[0] if len(grid) == 1 else random.Random(f"{cfg.seed}:{cut_id}:{i}").choice(grid))
+    return out
+
+
+def speed_copies(cfg: ZipformerTrainConfig, cuts: CutSet) -> tuple[list[MonoCut], list[str]]:
+    """`(kept copies, dropped copy ids)` in block order (all copies of range 0, then 1, ...).
+
+    The CTC frame budget is checked per copy at the factor actually applied to it,
+    so a cut too short only at its fastest factor keeps its slower copies.
+    Perturbed ids get Lhotse's `_sp<factor>` suffix; disjoint ranges keep them unique.
+    """
+    factor = cfg.output_downsampling_factor
+    factors = {cut.id: copy_factors(cfg, cut.id) for cut in cuts}
+    kept, dropped = [], []
+    for i in range(len(speed_ranges(cfg))):
+        for cut in cuts:
+            speed = factors[cut.id][i]
+            if not fb._is_silence(cut) and fb.ratio(cut.duration, fb._text(cut), factor, speed) < 1:
+                dropped.append(cut.id if speed == 1.0 else f"{cut.id}_sp{speed}")
+                continue
+            kept.append(cut if speed == 1.0 else cut.perturb_speed(speed))
+    return kept, dropped
+
+
 def _train_cuts(
     cfg: ZipformerTrainConfig, data_dir: Path, cuts: CutSet | None = None
 ) -> CutSet:
-    """Training cuts (`cuts` or the train manifest), x3 with speed perturbation.
+    """Training cuts (`cuts` or the train manifest), one static copy per speed range.
 
-    Perturbed ids get Lhotse's `_sp0.9` / `_sp1.1` suffix, so ids stay unique.
-    The concatenation is shuffled once with `cfg.seed`: DynamicBucketingSampler
-    only shuffles within a streaming buffer and fits bucket edges to the first
-    cuts, so block order would put all 0.9x audio first in every epoch. The
-    fixed seed keeps the order identical across runs, so resume stays exact.
+    The CutSet is fixed before batching (factors come from `copy_factors`), so
+    batch durations respect `max_duration` and the sampler order, hence resume,
+    stays exact. Copies failing the frame budget are left out (`speed_copies`).
+    With speed perturbation the concatenation is shuffled once with `cfg.seed`:
+    DynamicBucketingSampler only shuffles within a streaming buffer and fits
+    bucket edges to the first cuts, so block order would put all slow audio
+    first in every epoch.
     """
     base = cuts if cuts is not None else load_cuts(data_dir, "train")
+    kept, _ = speed_copies(cfg, base)
+    combined = CutSet.from_cuts(kept)
     if not cfg.speed_perturb:
-        return base
-    combined = CutSet.from_cuts([*base.perturb_speed(0.9), *base, *base.perturb_speed(1.1)])
+        return combined
     return combined.shuffle(rng=random.Random(cfg.seed))
 
 
@@ -81,11 +130,75 @@ def _sampler(cuts: CutSet, max_duration: float, **kwargs) -> DynamicBucketingSam
         )
 
 
+class _RandomCutTransform:
+    """Applies `_apply(cut)` to each cut with probability `p`.
+
+    The RNG is created lazily from `seed`; "randomized" gives every DataLoader
+    worker its own stream (needs Lhotse's `worker_init_fn`, as CutMix does).
+    Ids are preserved: the per-batch cut ids must not depend on augmentation.
+    """
+
+    def __init__(self, p: float, seed: int | str = "randomized") -> None:
+        self.p = p
+        self.seed = seed
+        self.rng: random.Random | None = None
+
+    def __call__(self, cuts: CutSet) -> CutSet:
+        if self.rng is None:
+            self.rng = random.Random(resolve_seed(self.seed))
+        return CutSet.from_cuts(self._apply(c) if self.rng.random() < self.p else c for c in cuts)
+
+    def _apply(self, cut):
+        raise NotImplementedError
+
+
+class RandomReverb(_RandomCutTransform):
+    """Reverb with a simulated room impulse response (Lhotse's FastRandomRIRGenerator,
+    no RIR download); the room and source seeds come from this transform's RNG.
+
+    The generator also draws from torch's global RNG, so the exact RIRs are not
+    reproducible run to run; resume only depends on the sampler order, not on them.
+    """
+
+    def _apply(self, cut):
+        return cut.reverb_rir(
+            affix_id=False,
+            room_rng_seed=self.rng.randrange(2**31),
+            source_rng_seed=self.rng.randrange(2**31),
+        )
+
+
+class RandomGainDb(_RandomCutTransform):
+    """Gain drawn uniformly in dB over `db_range`.
+
+    Lhotse's PerturbVolume draws a linear factor (0.125-2.0 by default), so the
+    quiet end (-18 dB) is hardly ever reached; quiet microphones are the case
+    to cover. Applied to a MixedCut it scales speech and noise together.
+    """
+
+    def __init__(self, p: float, db_range: tuple[float, float], seed: int | str = "randomized") -> None:
+        super().__init__(p, seed)
+        self.db_range = db_range
+
+    def draw_db(self) -> float:
+        return self.rng.uniform(*self.db_range)
+
+    def _apply(self, cut):
+        return cut.perturb_volume(factor=10 ** (self.draw_db() / 20), affix_id=False)
+
+
 def _dataset(
     cfg: ZipformerTrainConfig, noise_aug: CutSet | None, train: bool
 ) -> K2SpeechRecognitionDataset:
-    """Fbank dataset; `train` adds SpecAugment (eval datasets get no augmentation)."""
-    transforms = []
+    """Fbank dataset; `train` adds the cut augmentations and SpecAugment (eval
+    datasets get no augmentation).
+
+    Cut transforms run in this order: reverb (on the speech), noise CutMix, then
+    gain, so a quiet clip is quiet speech plus quiet noise, as from a far microphone.
+    """
+    transforms: list = []
+    if train and cfg.reverb_p > 0:
+        transforms.append(RandomReverb(cfg.reverb_p))
     if noise_aug is not None and len(noise_aug) > 0:
         # noise cuts carry an empty "silence" supervision; mixed in, it would add a
         # second supervision (and a bogus "" target) to the speech cut
@@ -101,6 +214,8 @@ def _dataset(
                 seed="randomized",
             )
         )
+    if train and cfg.volume_p > 0:
+        transforms.append(RandomGainDb(cfg.volume_p, cfg.volume_db))
     input_transforms = []
     if train:
         input_transforms.append(  # icefall's defaults

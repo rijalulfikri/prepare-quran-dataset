@@ -1,10 +1,15 @@
 """Training configuration for the Zipformer2-CTC pipeline."""
 
+import re
 from pathlib import Path
 from typing import Literal
 
 import yaml
 from pydantic import BaseModel, model_validator
+
+SPEED_STEP = 0.05  # grid of drawn speed factors: few distinct factors, few cached resamplers
+StressSet = Literal["vol-20db", "reverb", "speed1.25"]
+_METRIC_KEY = re.compile(r"(per_phonemes|[\w.\-]+/per_phonemes)")
 
 
 class ZipformerTrainConfig(BaseModel):
@@ -61,6 +66,22 @@ class ZipformerTrainConfig(BaseModel):
     speed_perturb: bool = True
     output_dir: str = "./results-zipformer-v0"
 
+    # --- augmentation (defaults reproduce the v0 pipeline) ---
+    # One static copy of every train cut per range; a range's factor is drawn per
+    # cut on a 0.05 grid from a seed and the cut id (see datamodule.copy_factors)
+    speed_factor_ranges: list[tuple[float, float]] = [(0.9, 0.9), (1.0, 1.0), (1.1, 1.1)]
+    reverb_p: float = 0.0  # simulated-RIR reverb, before the noise mix
+    volume_p: float = 0.0  # gain drawn uniformly in dB, after the noise mix
+    volume_db: tuple[float, float] = (-30.0, 6.0)
+
+    # --- per-epoch evaluation sets (defaults: legacy dev only) ---
+    dev_unseen_cuts_per_moshaf: int = 0  # fixed sample of cuts_test per test moshaf; 0 = off
+    eval_qdat: bool = False  # obadx/qdat_bench through the same PyTorch path as dev
+    stress_sets: list[StressSet] = []  # perturbed copies of the dev_unseen sample
+    # dev_metrics.jsonl key the early-stop rule follows (vastai/zipformer_watchdog.sh,
+    # zipformer_status.py); rows without it fall back to the legacy dev `per_phonemes`
+    early_stop_metric: str = "qdat/per_phonemes"
+
     # --- eval / export ---
     export_chunk_size: int = 24
     export_left_context: int = 256
@@ -97,7 +118,38 @@ class ZipformerTrainConfig(BaseModel):
                 "rclone_checkpoint_path must be an rclone `remote:path`, "
                 f"got {self.rclone_checkpoint_path!r}"
             )
+        self._validate_augmentation()
+        if self.stress_sets and self.dev_unseen_cuts_per_moshaf < 1:
+            raise ValueError("stress_sets perturb the dev_unseen sample; set dev_unseen_cuts_per_moshaf >= 1")
+        if self.dev_unseen_cuts_per_moshaf < 0:
+            raise ValueError("dev_unseen_cuts_per_moshaf must be >= 0")
+        if not _METRIC_KEY.fullmatch(self.early_stop_metric):
+            raise ValueError(
+                f"early_stop_metric must be 'per_phonemes' or '<set>/per_phonemes', got {self.early_stop_metric!r}"
+            )
         return self
+
+    def _validate_augmentation(self) -> None:
+        for name in ("reverb_p", "volume_p", "cutmix_p"):
+            if not 0 <= getattr(self, name) <= 1:
+                raise ValueError(f"{name} must be in [0, 1]")
+        for name in ("volume_db", "cutmix_snr"):
+            low, high = getattr(self, name)
+            if low > high:
+                raise ValueError(f"{name} must be (low, high) with low <= high, got {(low, high)}")
+        ranges = self.speed_factor_ranges
+        if not ranges:
+            raise ValueError("speed_factor_ranges needs at least one range")
+        for low, high in ranges:
+            on_grid = all(abs(x / SPEED_STEP - round(x / SPEED_STEP)) < 1e-6 for x in (low, high))
+            if not (0.5 <= low <= high <= 2.0 and on_grid):
+                raise ValueError(
+                    f"speed_factor_ranges entry {(low, high)} must satisfy 0.5 <= low <= high <= 2.0 "
+                    f"on a {SPEED_STEP} grid"
+                )
+        # disjoint ranges give every copy of a cut a different factor, hence a unique id
+        if any(a[1] >= b[0] for a, b in zip(ranges, ranges[1:])):
+            raise ValueError(f"speed_factor_ranges must be sorted and disjoint, got {ranges}")
 
     def _validate_chunk_context(self, chunk_sizes: list[int]) -> None:
         """Reject chunk / left-context pairs icefall's Zipformer2 asserts on.

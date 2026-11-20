@@ -54,7 +54,7 @@ Field terkait di config:
 | `drive_data_shards_path` | `null` (di `train_config.yml`: `utluma:RClone/Utluma/zipformer-shards`) | sumber kedua: shard yang sama (byte identik, `index.json` sama) di Drive, dipakai jika HF gagal |
 | `rclone_remote_path` | `utluma:RClone/Utluma/zipformer-data` | sumber terakhir: `rclone sync` file mentah ke `data_dir`, jika kedua sumber shard kosong atau gagal |
 | `data_dir` | `./data-zipformer` | lokasi data lokal di box |
-| `rclone_checkpoint_path` | `null` (di `train_config.yml`: `utluma:RClone/Utluma/zipformer-data/checkpoints/utluma-zipformer-ctc-v0`) | backup checkpoint ke Drive; `null` menonaktifkan backup |
+| `rclone_checkpoint_path` | `null` (di `train_config.yml`: `utluma-edit:RClone/Utluma/zipformer-data/checkpoints/utluma-zipformer-ctc-v1`) | backup checkpoint ke Drive; `null` menonaktifkan backup |
 
 **Waktu unduh data.** Dataset berisi ~306 ribu file FLAC kecil (~65 GiB). Google Drive membatasi jumlah request per detik, sehingga `rclone sync` butuh ±2 jam di box Vast.ai. Karena itu `data_dir` yang sudah jadi juga disimpan sebagai 17 shard tar (±4 GiB) di repo dataset HF private `hf_data_repo`, yang terunduh jauh lebih cepat: semua shard (65 GiB) terunduh dan terverifikasi dalam ±4,5 menit (±250 MiB/s) di box RTX 5090 Vast.ai. Hasil ekstraksinya identik byte demi byte dengan data di Drive, jadi resume checkpoint tetap tepat.
 
@@ -98,9 +98,9 @@ Box meng-clone branch `--branch` (default `main`) dari GitHub, jadi push dulu co
 
 Tambahkan `--destroy-when-done` supaya box menghapus dirinya sendiri setelah training sukses (exit 0): `output_dir` (tanpa `checkpoint-*` / `epoch-*`, yang sudah di-backup) di-upload ke `--results-remote` (default `<rclone_checkpoint_path>-results`), diverifikasi dengan `rclone check`, lalu instance dihapus lewat API Vast.ai dengan `CONTAINER_ID` / `CONTAINER_API_KEY` milik instance itu (`vastai/upload_results_and_destroy.sh`). Jika training gagal atau berhenti (exit selain 0), atau upload/verifikasi gagal, instance dibiarkan hidup.
 
-Tambahkan `--early-stop-patience N` untuk berhenti lebih awal saat dev PER mendatar: `vastai/zipformer_watchdog.sh` berjalan di box (sesi tmux `watchdog`, log `~/zipformer_watchdog.log`) dan memeriksa `dev_metrics.jsonl` tiap 2 menit. Sebuah epoch dihitung rekor baru hanya jika dev PER-nya lebih rendah setidaknya `--early-stop-min-improvement` (default `0.05`, relatif) dari rekor sebelumnya. Setelah N epoch berturut-turut tanpa rekor baru, watchdog mengirim SIGTERM ke training (berhenti rapi, checkpoint di-flush), mengubah `num_epochs` di config box ke epoch terakhir, lalu menjalankan ulang pipeline yang sama: averaging 3 epoch terakhir, evaluasi test, export, dan dengan `--destroy-when-done` juga upload hasil + destroy. Watchdog tidak pernah memotong averaging / eval / export (hanya bertindak selama epoch terakhir < `num_epochs`).
+Tambahkan `--early-stop-patience N` untuk berhenti lebih awal saat metrik early stop mendatar: `vastai/zipformer_watchdog.sh` berjalan di box (sesi tmux `watchdog`, log `~/zipformer_watchdog.log`) dan memeriksa `dev_metrics.jsonl` tiap 2 menit. Metriknya adalah kunci `early_stop_metric` di config (bawaan `qdat/per_phonemes`, PER QDAT), atau `--early-stop-metric <kunci>` untuk run itu saja (lihat [Evaluasi tiap epoch](#evaluasi-tiap-epoch-augmentasi-dan-baseline)); `dev_metrics.jsonl` yang belum memuat kunci itu (mis. run lama) memakai `per_phonemes` dev lama, dan log watchdog menyebutkannya. Sebuah epoch dihitung rekor baru hanya jika metriknya lebih rendah setidaknya `--early-stop-min-improvement` (default `0.05`, relatif) dari rekor sebelumnya. Setelah N epoch berturut-turut tanpa rekor baru, watchdog mengirim SIGTERM ke training (berhenti rapi, checkpoint di-flush), mengubah `num_epochs` di config box ke epoch terakhir, lalu menjalankan ulang pipeline yang sama: averaging 3 epoch terakhir, evaluasi test, export, dan dengan `--destroy-when-done` juga upload hasil + destroy. Watchdog tidak pernah memotong averaging / eval / export (hanya bertindak selama epoch terakhir < `num_epochs`).
 
-Status run kapan saja: `python vastai/zipformer_status.py` (instance dicari lewat API Vast.ai, atau `--host/--port`). Baris pertamanya `STATUS: <keadaan>`, lalu tabel dev PER per epoch dengan hitungan early stop, menit per epoch, sisa credit dan perkiraan biaya, watchdog, GPU, dan error terakhir; `--drive` mencocokkan SHA-256 checkpoint epoch terbaru di Drive, dan `--wait` menunggu epoch baru atau perubahan status. Setelah instance di-destroy, skrip ini menampilkan isi folder hasil di Drive. Di Claude Code, `/zipformer-monitor` (`.claude/skills/zipformer-monitor`) memakai skrip ini untuk memantau run: melapor tiap epoch, mendiagnosis crash, dan memverifikasi destroy serta hasil di Drive; keputusan berhenti dan destroy tetap di watchdog dan di tangan kamu.
+Status run kapan saja: `python vastai/zipformer_status.py` (instance dicari lewat API Vast.ai, atau `--host/--port`). Baris pertamanya `STATUS: <keadaan>`, lalu tabel metrik early stop per epoch (beserta PER dev lama) dengan hitungan early stop, PER semua eval set di epoch terakhir, menit per epoch, sisa credit dan perkiraan biaya, watchdog, GPU, dan error terakhir; `--drive` mencocokkan SHA-256 checkpoint epoch terbaru di Drive, dan `--wait` menunggu epoch baru atau perubahan status. Setelah instance di-destroy, skrip ini menampilkan isi folder hasil di Drive. Di Claude Code, `/zipformer-monitor` (`.claude/skills/zipformer-monitor`) memakai skrip ini untuk memantau run: melapor tiap epoch, mendiagnosis crash, dan memverifikasi destroy serta hasil di Drive; keputusan berhenti dan destroy tetap di watchdog dan di tangan kamu.
 
 `train_zipformer.sh` melakukan, dan semua langkahnya idempotent:
 
@@ -116,9 +116,10 @@ Argumen tambahan diteruskan ke `train_zipformer.py`, mis. `bash train_zipformer.
 | Argumen | Default | Keterangan |
 |---|---|---|
 | `--config` | `configs/train_config.yml` | YAML config |
-| `--stage` | `all` | `prepare`, `train`, `eval`, `export`, atau `all` (= keempatnya berurutan) |
-| `--push-to-hub` | `false` | upload `export/`, `averaged-<k>.pt`, `config.yml`, `test_results.json`, `qdat_bench_test_results.json` ke `hub_model_id` |
-| `--rerun-testset` | `false` | evaluasi ulang test set walau `test_results.json` sudah ada |
+| `--stage` | `all` | `prepare`, `train`, `eval`, `export`, atau `all` (= keempatnya berurutan); `evalsets` (= `prepare` lalu skor checkpoint `--checkpoint`, tanpa training; tidak termasuk `all`) |
+| `--checkpoint` | - | untuk `--stage evalsets`: path lokal atau rclone `remote:path` sebuah `epoch-*.pt` / `checkpoint-*.pt` / `averaged-*.pt`; boleh diulang |
+| `--push-to-hub` | `false` | upload `export/`, `averaged-<k>.pt`, `config.yml`, `test_results.json`, `qdat_bench_test_results.json`, `eval_sets_results.json` ke `hub_model_id` |
+| `--rerun-testset` | `false` | evaluasi ulang test set dan eval set walau `test_results.json` / `eval_sets_results.json` sudah ada |
 | `--rerun-qdat-bench` | `false` | jalankan ulang qdat_bench walau hasilnya sudah ada |
 | `--device` | `cuda` jika ada, selain itu `cpu` | device untuk train/eval |
 
@@ -126,30 +127,111 @@ Stage:
 
 * `prepare`: unduh shard tar (4 paralel) dari `hf_data_repo`, atau dari `drive_data_shards_path` jika HF gagal, cek sha256 terhadap `index.json`, ekstrak ke `data_dir`; shard yang sudah selesai dilewati saat dijalankan ulang. Jika kedua sumber gagal (atau kosong): `rclone sync <rclone_remote_path> <data_dir> --progress --transfers 32 --checkers 32 --fast-list --drive-pacer-min-sleep 10ms --drive-pacer-burst 200 --exclude "/checkpoints/**"`. Gagal dengan pesan jelas jika `rclone` tidak ada atau belum ada remote (`rclone listremotes` kosong).
 * `train`: training dengan resume otomatis dari checkpoint lokal atau Drive (mana yang lebih baru), lalu merata-ratakan `avg_last_k` epoch terakhir menjadi `averaged-<k>.pt`. Jika `rclone lsjson` ke Drive gagal, muncul warning dan training lanjut dengan checkpoint lokal saja.
-* `eval`: PER test set (`per_phonemes`) dengan `export_chunk_size` / `export_left_context` → `test_results.json` (dilewati jika sudah ada, kecuali `--rerun-testset`).
+* `eval`: model rata-rata pada seluruh test set (`per_phonemes`) dengan `export_chunk_size` / `export_left_context` → `test_results.json`, dan pada semua eval set tiap epoch (kunci sama dengan `dev_metrics.jsonl`) → `eval_sets_results.json`; masing-masing dilewati jika sudah ada, kecuali `--rerun-testset`.
+* `evalsets` (hanya jika diminta): skor checkpoint lama pada eval set config tanpa training → `eval_sets/<nama checkpoint>.json`; lihat [baseline](#baseline-checkpoint-lama).
 * `export`: ONNX streaming fp32 + int8 ke `export/`, cek bahwa decode ONNX cocok dengan PyTorch pada 5 cut test (kesesuaian argmax per frame ≥ 99 % dan PER token ONNX vs PyTorch ≤ 1 %; keduanya dicatat di log), lalu qdat_bench dengan model ONNX fp32.
 
 Exit code: `0` sukses, `143` berhenti dengan aman (mis. SIGTERM; checkpoint sudah di-flush), `1` gagal.
 
+## Evaluasi tiap epoch, augmentasi, dan baseline
+
+Model v0 (Drive: `checkpoints/utluma-zipformer-ctc-v0`, rata-rata epoch 28–30) sudah jenuh di format datanya sendiri: test PER 0,26 % (qari yang disisihkan), dev PER 0,29 %, dan kurva dev datar sejak sekitar epoch 18. Pada suara awam ia jauh lebih buruk (QDAT, 159 rekaman HP, 120 di antaranya perempuan: PER 16,0 %) dan peka terhadap volume pelan, gema, dan tempo cepat. Dev lama (10 % acak dari kumpulan latih, qari yang sama) tidak bisa melihat itu. Karena itu tiap epoch sekarang dievaluasi pada beberapa set, dan augmentasi baru menyasar kelemahan yang terukur.
+
+### Eval set tiap epoch
+
+Set dibentuk saat training dimulai dari berkas yang sudah ada di `data_dir`. Pembagian train/dev dan shard data tidak berubah.
+
+| Set (prefix kunci) | Isi | Field config |
+|---|---|---|
+| (tanpa prefix) | dev lama, `dev_max_cuts` cut pertama, persis seperti v0 | `dev_max_cuts` |
+| `dev_unseen` | sampel tetap dari `cuts_test` (moshaf 19.0, 29.0, 30.0), `dev_unseen_cuts_per_moshaf` cut per moshaf, diambil dengan seed `seed` dari cut yang diurutkan per id | `dev_unseen_cuts_per_moshaf` (0 = mati) |
+| `qdat` | 159 klip `obadx/qdat_bench`, label `phonetic_transcript` tanpa spasi (sama dengan penilai qdat_bench); audio di-decode seperti jalur ONNX (librosa 16 kHz), disimpan sekali di `data_dir/eval_qdat/`. Hanya untuk evaluasi, tidak pernah dilatih | `eval_qdat` |
+| `dev_unseen_vol-20db` | sampel `dev_unseen` dengan volume −20 dB | `stress_sets` |
+| `dev_unseen_reverb` | sampel `dev_unseen` dengan gema simulasi tetap (bank 64 RIR dari seed `seed`, cut ke-*i* memakai RIR ke-*i* mod 64) | `stress_sets` |
+| `dev_unseen_speed1.25` | sampel `dev_unseen` dengan speed ×1,25 | `stress_sets` |
+
+Semua set di-decode dengan jalur PyTorch yang sama (`evaluate_split`, `export_chunk_size` / `export_left_context`). Satu epoch = satu baris `dev_metrics.jsonl`; kunci dev lama tidak berubah, set lain diberi prefix:
+
+```json
+{"epoch": 5, "batch_idx_train": 72100, "per_phonemes": 0.0061, "silence_per": 0.0001, "num_speech": 1819, "num_silence": 181,
+ "dev_unseen/per_phonemes": 0.0052, "dev_unseen/num_speech": 3000,
+ "dev_unseen_vol-20db/per_phonemes": 0.011, "dev_unseen_vol-20db/num_speech": 3000, "...": "...",
+ "qdat/per_phonemes": 0.152, "qdat/num_speech": 159}
+```
+
+TensorBoard / W&B: dev lama di `dev/*`, set lain di `eval/<set>/*`. Stage `eval` menulis metrik yang sama untuk model rata-rata ke `eval_sets_results.json`.
+
+`dev_unseen` memakai qari test. Itu disengaja (qari latih hanya 17, jadi tidak ada qari yang disisihkan lagi), dengan konsekuensi: setelah memilih epoch atau config berdasarkan `dev_unseen`, `test_results.json` bukan lagi angka yang sama sekali tak tersentuh.
+
+Biaya: di run v0 (RTX 5090), jeda antara log train terakhir dan baris dev, termasuk simpan checkpoint epoch dan eval dev 2000 cut (±6 jam audio), hanya 12–17 detik per epoch, dari epoch ±57,5 menit. Set baru di `train_config.yml` berisi ±30 jam audio (3000 cut `dev_unseen` × 4 set ditambah QDAT), sehingga perkiraannya +1–1,5 menit per epoch (±2–3 %). Bank RIR dibuat sekali saat start (±1 detik), dan QDAT diunduh sekali per `data_dir`.
+
+### Metrik early stop
+
+`early_stop_metric` (bawaan `qdat/per_phonemes`) adalah kunci `dev_metrics.jsonl` yang diikuti aturan rekor watchdog dan `zipformer_status.py`. Pilihannya `per_phonemes` (dev lama) atau `<set>/per_phonemes` dari tabel di atas. `run_zipformer_training.py --early-stop-metric <kunci>` mengganti nilai config untuk satu run. Jika belum ada baris yang memuat kunci itu (`dev_metrics.jsonl` run lama), watchdog dan status memakai `per_phonemes` dan menyebutkannya, sehingga berkas lama tetap terbaca.
+
+Catatan soal QDAT sebagai metrik henti: QDAT hanya 159 klip pendek (9.241 fonem). Bootstrap per klip atas prediksi v0 memberi PER 16,0 % dengan simpangan baku 1,6 poin (±10 % relatif, CI 95 % 13,0–19,3 %), dan PER per klip sangat berekor (p90 40 %). Ambang 5 % relatif berada di bawah derau pengambilan sampel itu; selisih antar epoch pada klip yang sama lebih kecil, tetapi segelintir klip bisa menggeser rekor. Selain itu, berhenti berdasarkan QDAT berarti QDAT tidak lagi angka akhir yang netral. Alternatif yang lebih stabil adalah `dev_unseen_vol-20db/per_phonemes` atau `dev_unseen_reverb/per_phonemes` (3000 cut), dengan QDAT tetap dicatat.
+
+### Augmentasi
+
+Semua bawaan di `config.py` mematikan augmentasi baru, sehingga config lama menghasilkan pipeline v0. `train_config.yml` menyalakan nilai baru:
+
+| Field | Bawaan (= v0) | `train_config.yml` | Keterangan |
+|---|---|---|---|
+| `speed_perturb`, `speed_factor_ranges` | `true`, `[[0.9,0.9],[1.0,1.0],[1.1,1.1]]` | `[[0.85,0.95],[1.0,1.0],[1.05,1.25]]` | satu salinan statis per rentang; faktor tiap cut diambil di grid 0,05 dari seed + id cut (`copy_factors`). Rentang harus terurut dan tidak tumpang tindih |
+| `cutmix_p`, `cutmix_snr` | `0.5`, `[10, 20]` | `0.5`, `[5, 20]` | derau dicampur pada SNR seragam |
+| `reverb_p` | `0.0` | `0.3` | gema RIR simulasi Lhotse (tanpa unduhan), dikenakan pada ucapan sebelum derau |
+| `volume_p`, `volume_db` | `0.0`, `[-30, 6]` | `0.5`, `[-30, 6]` | gain seragam dalam dB, paling akhir (sesudah derau), seperti mikrofon pelan. `PerturbVolume` Lhotse mengambil faktor linear 0,125–2,0 sehingga level pelan hampir tak pernah terambil |
+
+Urutan transform: gema → CutMix → gain → fbank → SpecAugment. Dengan nilai di atas, 35 % salinan tidak kena gema maupun gain, dan 17,5 % juga tanpa derau, sehingga PER bersih tetap terlatih.
+
+Speed tetap berupa salinan statis, bukan transform acak sesudah batching. Akibatnya CutSet sudah tetap sebelum sampler, durasi batch tetap menghormati `max_duration` (memori GPU), dan resume tetap tepat. Kelayakan frame CTC (`L + R`) dicek per salinan pada faktor yang benar-benar dikenakan; cut yang hanya tidak muat pada salinan tercepatnya tetap memakai salinan lainnya (`dropped_cuts.json` mencatat id salinan). `max_dropped_fraction` dihitung atas salinan train ditambah cut dev. Di data saat ini rasio frame minimum pada speed 1,1 adalah 2,9, jadi pada 1,25 (±2,6) tidak ada yang terbuang. Rata-rata `1/faktor` turun dari 3,020 ke 2,986 jam audio per jam data, sehingga epoch ±1,1 % lebih pendek (±14,26 ribu batch dari ±14,43 ribu). Jadwal LR Eden (per batch dan per epoch) praktis tidak berubah.
+
+Resume: sampler tetap melanjutkan tepat di batch berikutnya dengan isi cut yang sama. Dengan CutMix aktif, urutan cut *di dalam* sebuah batch bisa berbeda setelah resume (CutMix mem-pad cut yang dicampur, dataset mengurutkan batch per durasi, dan RNG CutMix mulai ulang). Ini sudah berlaku di v0; tes lama memakai cut berdurasi sama sehingga tidak terlihat.
+
+Tidak dikerjakan:
+
+* Tempo: `PerturbTempo` Lhotse memakai `torchaudio.sox_effects`, yang tidak ada lagi di torchaudio 2.9+ (sudah dicek di 2.11). Rentang speed yang lebih lebar menggantikannya.
+* Geser pitch: `torchaudio.functional.pitch_shift` butuh ±0,36 detik per klip 12 detik (1 thread). Pada p 0,3 itu ±5 detik per batch per worker, setara dengan anggaran ±5,8 detik per batch per worker (24 worker, ±0,24 detik per langkah GPU), sehingga data loader akan menjadi leher botol. Gema pada p 0,3 hanya menambah ±0,3 detik per batch per worker (±19 ms per klip).
+
+### Baseline checkpoint lama
+
+Angka v0 pada set baru, tanpa training, dengan `configs/eval_baseline_v0.yml` (dimensi model dan eval set sama dengan `train_config.yml`, `output_dir` sendiri):
+
+```bash
+# di box GPU (stage evalsets menjalankan prepare dulu; shard yang sudah ada dilewati)
+python train_zipformer.py --config configs/eval_baseline_v0.yml --stage evalsets \
+    --checkpoint utluma-edit:RClone/Utluma/zipformer-data/checkpoints/utluma-zipformer-ctc-v0-results/averaged-3.pt \
+    --checkpoint utluma-edit:RClone/Utluma/zipformer-data/checkpoints/utluma-zipformer-ctc-v0/epoch-30.pt
+
+# atau dari komputer lokal lewat Vast.ai (upload hasil + destroy setelah selesai)
+python vastai/run_zipformer_training.py --offer-id <OFFER_ID> --config configs/eval_baseline_v0.yml \
+    --destroy-when-done --follow -- --stage evalsets \
+    --checkpoint utluma-edit:RClone/Utluma/zipformer-data/checkpoints/utluma-zipformer-ctc-v0-results/averaged-3.pt
+```
+
+Hasilnya `results-zipformer-v0-baseline/eval_sets/<checkpoint>.json`, dengan kunci yang sama dengan `dev_metrics.jsonl`; dengan `--destroy-when-done` diunggah ke `.../utluma-zipformer-ctc-v0-baseline-results`. Angka pemeriksa untuk `averaged-3.pt`: dev ±0,29 % (epoch 28–30 tercatat 0,29–0,32 %), dan QDAT ±16,0 %. Jalur ONNX v0 memberi 16,03 %; skor ulang prediksi itu dengan tokenisasi dan label tanpa spasi yang dipakai di sini juga 16,03 %. Jika QDAT jauh dari 16 %, curigai decode audio atau label. Test set penuh (0,26 %) tidak termasuk `evalsets`; jalankan `--stage eval` dengan `averaged-3.pt` di `output_dir` jika perlu.
+
 ## 4. Lokasi output
 
-Semua di `output_dir` (default `./results-zipformer-v0`, yaitu `zipformer/results-zipformer-v0`):
+Semua di `output_dir` (di `train_config.yml`: `./results-zipformer-v1`, yaitu `zipformer/results-zipformer-v1`):
 
 | Path | Isi |
 |---|---|
 | `checkpoint-*.pt`, `epoch-*.pt` (+ `.meta.json`) | checkpoint tiap `save_every_n_batches` batch dan tiap epoch (masing-masing `keep_last_k` terakhir); juga di-backup ke `rclone_checkpoint_path` |
 | `averaged-<avg_last_k>.pt` | model akhir (rata-rata epoch terakhir) |
 | `config.yml` | config yang dipakai |
-| `dev_metrics.jsonl` | metrik dev per epoch |
+| `dev_metrics.jsonl` | satu baris per epoch: metrik dev lama + semua eval set (lihat [Evaluasi tiap epoch](#evaluasi-tiap-epoch-augmentasi-dan-baseline)) |
+| `dropped_cuts.json` | salinan speed (train) dan cut dev yang gagal cek frame CTC |
 | `tb/` | log TensorBoard (W&B juga dipakai jika `WANDB_API_KEY` di-set) |
-| `test_results.json` | hasil stage `eval` |
+| `test_results.json`, `eval_sets_results.json` | hasil stage `eval` (model rata-rata) |
+| `eval_sets/<checkpoint>.json` | hasil `--stage evalsets` |
 | `qdat_bench_predictions.jsonl`, `qdat_bench_test_results.json` | hasil qdat_bench |
 | `export/model.onnx`, `export/model.int8.onnx`, `export/tokens.txt` | model untuk sherpa-onnx |
 
 Download ke komputer lokal:
 
 ```bash
-scp -P <PORT> -r root@<IP_VAST_AI>:~/prepare-quran-dataset/zipformer/results-zipformer-v0/export ./
+scp -P <PORT> -r root@<IP_VAST_AI>:~/prepare-quran-dataset/zipformer/results-zipformer-v1/export ./
 ```
 
 ## Jika box Vast.ai mati di tengah training
