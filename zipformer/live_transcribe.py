@@ -11,6 +11,7 @@ one starts. Ctrl+C stops.
     python live_transcribe.py --model-dir results-zipformer-v0/export-epoch-18
     python live_transcribe.py --model-dir ... --sura 1 --aya 6   # PER per line
     python live_transcribe.py --model-dir ... --wav ayah.flac    # file, in real time
+    python live_transcribe.py --model-dir ... --save-wav sesi.wav  # keep what the model heard
     python live_transcribe.py \\
         --model .../utluma_cek_tilawah/model/zipformer_p_arabic_v3_c16_utluma3.int8.ort \\
         --tokens .../utluma_cek_tilawah/assets/model/tokens.txt
@@ -43,6 +44,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--device", help="input device index or name (default: system mic); see --list-devices")
     p.add_argument("--list-devices", action="store_true", help="list audio devices and exit")
     p.add_argument("--wav", help="stream this audio file in real time instead of the mic")
+    p.add_argument("--save-wav", help="also write the audio fed to the model (16 kHz mono) to this file, "
+                   "e.g. to replay a mic session with --wav")
     p.add_argument("--sura", type=int, help="with --aya: print each finished line's PER against this ayah")
     p.add_argument("--aya", type=int)
     p.add_argument("--pause", type=float, default=1.2,
@@ -207,16 +210,29 @@ def main(argv: list[str] | None = None) -> int:
         stream = recognizer.create_stream()
         shown = ""
 
+    saved = None
+    if args.save_wav:
+        import soundfile as sf
+
+        # written block by block, so Ctrl+C still leaves a playable file
+        saved = sf.SoundFile(args.save_wav, "w", samplerate=SAMPLE_RATE, channels=1, subtype="PCM_16")
     try:
-        for block in audio_blocks(args):
-            stream.accept_waveform(SAMPLE_RATE, block)
-            decode_and_show()
-            if pauses.update(block):
-                finish_line()
-    except KeyboardInterrupt:
-        pass
-    if shown:
-        finish_line()
+        try:
+            for block in audio_blocks(args):
+                if saved is not None:
+                    saved.write(block)
+                stream.accept_waveform(SAMPLE_RATE, block)
+                decode_and_show()
+                if pauses.update(block):
+                    finish_line()
+        except KeyboardInterrupt:
+            pass
+        if shown:
+            finish_line()
+    finally:
+        if saved is not None:
+            saved.close()
+            print(f"saved {args.save_wav}")
     return 0
 
 
