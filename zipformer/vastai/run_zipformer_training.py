@@ -516,9 +516,9 @@ def launch_training(args, host, port, wait_ssh=False):
     print("[1/6] Cek koneksi SSH & GPU")
     run_command(ssh + ["nvidia-smi --query-gpu=name,memory.total --format=csv,noheader; df -h /root | tail -1"], dry)
 
-    print("\n[2/6] Install git, tmux, curl (jika belum ada)")
+    print("\n[2/6] Install git, tmux, curl, unzip (jika belum ada)")
     run_command(ssh + [
-        "for c in git tmux curl; do command -v $c >/dev/null || missing=\"$missing $c\"; done; "
+        "for c in git tmux curl unzip; do command -v $c >/dev/null || missing=\"$missing $c\"; done; "
         "if [ -n \"$missing\" ]; then apt-get update && apt-get install -y $missing; fi"
     ], dry)
 
