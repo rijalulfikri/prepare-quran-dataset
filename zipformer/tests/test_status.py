@@ -129,3 +129,29 @@ def test_to_wib_shifts_box_utc_stamps_and_rolls_the_date():
     )
     assert zs.to_wib("2026-11-22 10:00:00 watchdog mulai") == "2026-11-22 17:00:00 WIB watchdog mulai"
     assert zs.to_wib("tanpa timestamp") == "tanpa timestamp"
+
+
+def test_to_wib_leaves_stamps_alone_on_a_box_already_in_wib():
+    off = zs.box_offset("2026-11-23 00:34:17 +0700")
+    assert zs.to_wib("2026-11-23 00:29:39,334 INFO x", off) == "2026-11-23 00:29:39,334 WIB INFO x"
+
+
+def test_box_offset_reads_the_utc_offset_and_defaults_to_utc():
+    from datetime import timedelta
+
+    assert zs.box_offset("2026-11-22 17:34:17 +0000") == timedelta(0)
+    assert zs.box_offset("2026-11-23 00:34:17 +0700") == timedelta(hours=7)
+    assert zs.box_offset("2026-11-22 17:34:17") == timedelta(0)  # box probed by an older status script
+
+
+def test_print_status_header_in_wib_for_a_wib_box(monkeypatch, capsys):
+    sections = {"NOW": ["2026-11-23 00:34:17 +0700"], "TRAINER": ["42"], "NUM_EPOCHS": ["30"], "METRICS": [],
+                "WATCHDOG": ["session", "running", "2026-11-23 00:27:10 watchdog mulai"]}
+    monkeypatch.setattr(zs, "find_box", lambda args: ("1.2.3.4", "22", None))
+    monkeypatch.setattr(zs, "probe", lambda args, host, port: sections)
+    monkeypatch.setattr(zs, "vast_credit", lambda: None)
+    args = type("A", (), {"patience": 4, "min_improvement": 0.05, "metric": None, "rows": 8, "drive": False})()
+    zs.print_status(args, zs.collect(args))
+    out = capsys.readouterr().out
+    assert "waktu box 2026-11-23 00:34:17 WIB," in out
+    assert "  2026-11-23 00:27:10 WIB watchdog mulai" in out

@@ -78,7 +78,7 @@ out=$(val output_dir); case "$out" in /*) ;; *) out="$Z/$out" ;; esac
 # Log berisi semua run di box ini; bagian per-run dimulai dari header train_zipformer.sh terakhir
 start=$(grep -a -n 'PIPELINE TRAINING' "$LOG" 2>/dev/null | tail -1 | cut -d: -f1)
 cur() { tail -n +"${start:-1}" "$LOG" 2>/dev/null; }
-echo @@NOW; date -u '+%%F %%T'
+echo @@NOW; date '+%%F %%T %%z'
 echo @@CONFIG; echo "$cfg"
 echo @@NUM_EPOCHS; val num_epochs
 echo @@CKPT_PATH; val rclone_checkpoint_path
@@ -200,10 +200,19 @@ WIB = timedelta(hours=7)
 _STAMP = re.compile(r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)(,\d+)?")
 
 
-def to_wib(text):
-    """Ganti timestamp UTC box (`YYYY-MM-DD HH:MM:SS[,ms]`) di `text` dengan WIB (UTC+7)."""
+def box_offset(now_line):
+    """Offset UTC zona waktu box dari baris NOW (`... +0700`); UTC jika tidak ada."""
+    m = re.search(r"([+-])(\d\d)(\d\d)$", (now_line or "").strip())
+    if not m:
+        return timedelta(0)
+    sign = -1 if m.group(1) == "-" else 1
+    return sign * timedelta(hours=int(m.group(2)), minutes=int(m.group(3)))
+
+
+def to_wib(text, offset=timedelta(0)):
+    """Ganti timestamp box (`YYYY-MM-DD HH:MM:SS[,ms]`, zona box = UTC+offset) di `text` dengan WIB."""
     def shift(m):
-        t = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S") + WIB
+        t = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S") + WIB - offset
         return f"{t:%Y-%m-%d %H:%M:%S}{m.group(2) or ''} WIB"
     return _STAMP.sub(shift, text)
 
@@ -326,9 +335,12 @@ def print_status(args, st):
         print(f"STATUS: API_ERROR — {STATES['API_ERROR']}")
         return
     s = st["sections"]
+    now = first(s, "NOW") or ""
+    off = box_offset(now)
+    now_wib = to_wib(re.sub(r" [+-]\d{4}$", "", now), off)
     print(f"STATUS: {st['state']} — {STATES[st['state']]}")
     print(f"Box: {st['host']}:{st['port']}" + (f" (instance {st['instance_id']})" if st["instance_id"] else "")
-          + f", waktu box {to_wib(first(s, 'NOW'))}, config {first(s, 'CONFIG')}")
+          + f", waktu box {now_wib}, config {first(s, 'CONFIG')}")
 
     table, best = st["table"], st["best"]
     rule = f"rekor = < rekor x {1 - st['min_rel']:.2f}" + ("" if st["watchdog_params_known"] else " (default; watchdog tidak ditemukan)")
@@ -374,7 +386,7 @@ def print_status(args, st):
     print(f"\nWatchdog: {wd_state}")
     for l in wd:
         if l not in ("session", "running"):
-            print(f"  {to_wib(l)}")
+            print(f"  {to_wib(l, off)}")
     if first(s, "GPU"):
         print(f"GPU: {first(s, 'GPU')}")
     for key, label in (("STAGE", "Tahap terakhir"), ("ENDED", "Akhir run"), ("FINISH", "Upload/destroy"), ("ERRORS", "Error di log")):
@@ -382,7 +394,7 @@ def print_status(args, st):
         if lines:
             print(f"{label}:")
             for l in lines:
-                print(f"  {to_wib(l)[:220]}")
+                print(f"  {to_wib(l, off)[:220]}")
 
     if args.drive:
         ckpt = first(s, "CKPT_PATH")

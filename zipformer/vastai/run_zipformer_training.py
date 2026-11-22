@@ -98,6 +98,8 @@ WATCHDOG_SCRIPT = "zipformer_watchdog.sh"
 REMOTE_WATCHDOG = f"/root/{WATCHDOG_SCRIPT}"
 REMOTE_RELAUNCH = "/root/zipformer_relaunch.sh"
 WATCHDOG_SESSION = "watchdog"
+# Zona waktu sesi training & watchdog: WIB. String POSIX, jadi tidak butuh tzdata di image
+BOX_TZ = "WIB-7"
 DEFAULT_EARLY_STOP_MIN_IMPROVEMENT = 0.05
 K2_VARS = ("K2_WHEEL_URL", "K2_WHEEL_URL_CP312")
 DEFAULT_TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu128"  # sama dengan train_zipformer.sh
@@ -384,7 +386,7 @@ def build_train_command(args):
         f"{train_cmd} 2>&1 | tee -a {REMOTE_LOG}",
     ])
     inner = (
-        f"rm -f {REMOTE_DONE_MARKER}; set -o pipefail; {inner}; code=$?; "
+        f"export TZ={BOX_TZ}; rm -f {REMOTE_DONE_MARKER}; set -o pipefail; {inner}; code=$?; "
         f"echo \"[train_zipformer.sh selesai, exit code $code]\" | tee -a {REMOTE_LOG}"
     )
     if args.destroy_when_done:
@@ -415,6 +417,7 @@ def build_launch_command(args):
 def build_watchdog_command(args):
     """Command bash di box untuk (ulang) menjalankan zipformer_watchdog.sh di sesi tmux sendiri."""
     env = [
+        f"TZ={BOX_TZ}",
         f"PATIENCE={args.early_stop_patience}",
         f"MIN_REL_IMPROVEMENT={args.early_stop_min_improvement}",
         f"REPO_ZIPFORMER_DIR={REMOTE_REPO_DIR}/zipformer",

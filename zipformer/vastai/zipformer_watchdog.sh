@@ -44,7 +44,8 @@ LOG=/root/train_zipformer.log
 DONE_MARKER=/root/.train_zipformer.done
 TRAINER='python [t]rain_zipformer.py --config'
 
-say() { echo "$(date -u '+%F %T') $*" | tee -a "$WLOG"; }
+# Zona waktu sesi (TZ dari launcher, mis. WIB); box tanpa TZ tetap UTC
+say() { echo "$(date '+%F %T') $*" | tee -a "$WLOG"; }
 
 # Nilai skalar `key: value` dari config YAML (tanpa kutip / komentar)
 config_value() {
