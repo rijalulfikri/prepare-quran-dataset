@@ -102,6 +102,14 @@ WATCHDOG_SESSION = "watchdog"
 BOX_TZ = "WIB-7"
 # Dibaca zipformer_status.py: shell SSH tetap UTC, log sesi memakai BOX_TZ
 REMOTE_TZ_FILE = "/root/zipformer_tz"
+# Batas bawah box: fbank/augmentasi berjalan on the fly di num_workers proses dataloader.
+# 2026-11-23: box 8 core / 30 GB RAM di-OOM-kill di epoch 1; 48 core / 108 GB memakai ~34 GB.
+MIN_RAM_GB = 64
+# nproc; batas memori cgroup v2, lalu v1; MemTotal host (byte)
+BOX_RESOURCES_PROBE = (
+    "nproc; cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null "
+    "|| echo max; awk '/MemTotal/ {print $2 * 1024}' /proc/meminfo"
+)
 DEFAULT_EARLY_STOP_MIN_IMPROVEMENT = 0.05
 K2_VARS = ("K2_WHEEL_URL", "K2_WHEEL_URL_CP312")
 DEFAULT_TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu128"  # sama dengan train_zipformer.sh
@@ -178,6 +186,30 @@ def check_config_matches_commit(config, commit, branch, dry_run=False):
     print(f"  Push commit yang memuat field itu (git push origin {branch}) atau pilih --branch yang benar.")
     if not dry_run:
         sys.exit(1)
+
+
+def config_num_workers(config_text):
+    """`num_workers` dari teks YAML config (tanpa PyYAML); None jika tidak ada."""
+    m = re.search(r"^num_workers:\s*(\d+)", config_text, re.M)
+    return int(m.group(1)) if m else None
+
+
+def parse_box_resources(probe_output):
+    """(cpu, byte RAM yang boleh dipakai container) dari output BOX_RESOURCES_PROBE."""
+    lines = [l.strip() for l in probe_output.strip().splitlines() if l.strip()]
+    cpus, limit, host_total = int(lines[0]), lines[1], int(float(lines[2]))
+    mem = min(int(limit), host_total) if limit.isdigit() else host_total
+    return cpus, mem
+
+
+def resource_problems(cpus, mem_bytes, num_workers):
+    """Alasan box terlalu kecil untuk training (list kosong = cukup)."""
+    problems = []
+    if num_workers and cpus < num_workers:
+        problems.append(f"box hanya punya {cpus} CPU, kurang dari num_workers {num_workers} di config")
+    if mem_bytes < MIN_RAM_GB * 2**30:
+        problems.append(f"RAM box {mem_bytes / 2**30:.0f} GiB, kurang dari minimum {MIN_RAM_GB} GiB")
+    return problems
 
 
 def check_local_config(config_path):
@@ -484,6 +516,8 @@ def main():
                              "dev_unseen/per_phonemes (default: early_stop_metric di config training)")
     parser.add_argument("--follow", action="store_true",
                         help="tampilkan log training setelah dijalankan (Ctrl+C tidak menghentikan training)")
+    parser.add_argument("--skip-resource-check", action="store_true",
+                        help=f"jangan hentikan launch jika CPU < num_workers atau RAM < {MIN_RAM_GB} GiB")
     parser.add_argument("--dry-run", action="store_true", help="cetak command tanpa menjalankannya")
     parser.add_argument("train_args", nargs="*",
                         help="argumen tambahan untuk train_zipformer.sh, setelah '--' (mis. -- --push-to-hub)")
@@ -505,6 +539,32 @@ def main():
         raise
 
 
+def check_box_resources(ssh, args):
+    """Hentikan launch jika CPU/RAM box di bawah batas (lihat MIN_RAM_GB); --skip-resource-check melewatinya."""
+    out = subprocess.run(ssh + [BOX_RESOURCES_PROBE], capture_output=True, text=True).stdout
+    try:
+        cpus, mem = parse_box_resources(out)
+    except (ValueError, IndexError):
+        print(f"PERINGATAN: CPU/RAM box tidak terbaca ({out.strip()!r}); pengecekan dilewati.")
+        return
+    config_path = args.config or os.path.join(SCRIPT_DIR, "..", "configs", "train_config.yml")
+    with open(config_path, encoding="utf-8") as f:
+        num_workers = config_num_workers(f.read())
+    print(f"Box: {cpus} CPU, RAM {mem / 2**30:.0f} GiB; config num_workers {num_workers}, minimum RAM {MIN_RAM_GB} GiB")
+    problems = resource_problems(cpus, mem, num_workers)
+    if not problems:
+        return
+    for p in problems:
+        print(f"  - {p}")
+    if args.skip_resource_check:
+        print("PERINGATAN: --skip-resource-check: lanjut walau box di bawah batas (risiko OOM di epoch pertama).")
+        return
+    print("Error: box terlalu kecil untuk training ini (box 8 CPU / 30 GB pernah di-OOM-kill di epoch 1).")
+    print("  Pilih offer dengan cpu_cores_effective >= num_workers dan cpu_ram >= "
+          f"{MIN_RAM_GB} GB, atau turunkan num_workers di config, atau --skip-resource-check.")
+    sys.exit(1)
+
+
 def launch_training(args, host, port, wait_ssh=False):
     """Langkah 1-6 di box (lihat docstring modul)."""
     ssh_opts = ["-i", args.identity, "-o", "StrictHostKeyChecking=accept-new", "-o", "ServerAliveInterval=30"]
@@ -518,8 +578,10 @@ def launch_training(args, host, port, wait_ssh=False):
         print("Error: SSH tidak bisa dihubungi. Pastikan public key dari --identity terdaftar di akun Vast.ai.")
         sys.exit(1)
 
-    print("[1/6] Cek koneksi SSH & GPU")
+    print("[1/6] Cek koneksi SSH, GPU, CPU & RAM")
     run_command(ssh + ["nvidia-smi --query-gpu=name,memory.total --format=csv,noheader; df -h /root | tail -1"], dry)
+    if not dry:
+        check_box_resources(ssh, args)
 
     print("\n[2/6] Install git, tmux, curl, unzip (jika belum ada)")
     run_command(ssh + [

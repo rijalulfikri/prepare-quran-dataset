@@ -117,7 +117,7 @@ dev_unseen_cuts_per_moshaf: 1000   # fixed sample of cuts_test (moshaf 19.0, 29.
 eval_qdat: true                # obadx/qdat_bench, 159 phone clips, eval only
 # perturbed copies of the dev_unseen sample, one per weakness (eval_sets.py)
 stress_sets: ["vol-20db", "vol-35db", "reverb", "speed1.25", "clip", "lead-noise", "pair-gap"]
-early_stop_metric: "qdat/per_phonemes"   # key the watchdog's new-best rule follows
+early_stop_metric: "dev_unseen/per_phonemes"   # key the watchdog's new-best rule follows; not QDAT (159 clips, too noisy: v1 epochs 1-4 went 22.9/22.4/23.5/19.3 while dev_unseen fell every epoch)
 
 # ---- eval / export ----
 export_chunk_size: 24          # must be one of chunk_size

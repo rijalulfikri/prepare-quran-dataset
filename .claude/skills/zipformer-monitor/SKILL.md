@@ -17,13 +17,15 @@ python zipformer/vastai/zipformer_status.py --wait     # blocks until a new epoc
 
 It finds the instance through the Vast.ai API on every call. Prefer that over pinning `--host/--port`: a host's public IP can change mid-run (seen 2026-11-19), and the API lookup follows it. Its first line is `STATUS: <STATE>`; `--help` and the module docstring describe the rest. Reply to the user in their language.
 
+Box sizing, credit, and early-stop rules for a run (CPU ≥ `num_workers`, RAM ≥ 64 GB, reliability ≥ 0.99, on-demand) are in `zipformer/README.md` → "Patokan box dan run Vast.ai"; when asked to pick or switch a machine, apply them before comparing prices.
+
 ## Loop
 
 1. Run `zipformer_status.py --drive` and send the first report.
 2. Start `zipformer_status.py --wait` as a **background** command and end your turn. You are re-invoked when it exits.
 3. On each notification: read its output, act on the STATE (table below), send a report, and start the next `--wait` — until the run reaches a terminal state.
 
-A **report** is: the last few rows of the early-stop table with the rekor marked (its metric is named in the table header: `qdat/per_phonemes` by default, or `per_phonemes` for an old run without eval sets), `Epoch tanpa rekor x/N`, the `PER eval set epoch N` line (legacy dev, dev_unseen, the stress sets, qdat), minutes per epoch, the earliest early-stop epoch, and credit. QDAT is 159 clips; an epoch-to-epoch move of a point or two is within its noise, so read it together with dev_unseen and the stress sets before calling a trend. Flag `CREDIT TIDAK CUKUP` prominently. Compare with earlier epochs you reported: say plainly when the curve is still improving and when it is flattening, and correct your own earlier reading when a new epoch contradicts it.
+A **report** is: the last few rows of the early-stop table with the rekor marked (its metric is named in the table header: `dev_unseen/per_phonemes` in the current config, `qdat/per_phonemes` for runs launched before 2026-11-23, or `per_phonemes` for an old run without eval sets), `Epoch tanpa rekor x/N`, the `PER eval set epoch N` line (legacy dev, dev_unseen, the stress sets, qdat), minutes per epoch, the earliest early-stop epoch, and credit. QDAT is 159 clips; an epoch-to-epoch move of a point or two is within its noise, so read it together with dev_unseen and the stress sets before calling a trend. Flag `CREDIT TIDAK CUKUP` prominently. Report times in WIB (the status output already converts). Compare with earlier epochs you reported: say plainly when the curve is still improving and when it is flattening, and correct your own earlier reading when a new epoch contradicts it.
 
 ## States
 

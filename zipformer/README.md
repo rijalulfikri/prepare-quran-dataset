@@ -73,7 +73,7 @@ cd zipformer && set -a && . ./.env && set +a
 
 ## 3. Jalankan di Vast.ai
 
-Sewa box dengan 1 GPU NVIDIA (mis. RTX 4090) dan disk yang cukup untuk data (~60 GB), environment, dan checkpoint, lalu:
+Sewa box sesuai [patokan box](#patokan-box-dan-run-vastai) (GPU, **CPU, RAM**, disk, reliability, credit), lalu:
 
 ```bash
 git clone https://github.com/rijalulfikri/prepare-quran-dataset.git && cd prepare-quran-dataset/zipformer
@@ -100,7 +100,7 @@ Box meng-clone branch `--branch` (default `main`) dari GitHub, jadi push dulu co
 
 Tambahkan `--destroy-when-done` supaya box menghapus dirinya sendiri setelah training sukses (exit 0): `output_dir` (tanpa `checkpoint-*` / `epoch-*`, yang sudah di-backup) di-upload ke `--results-remote` (default `<rclone_checkpoint_path>-results`), diverifikasi dengan `rclone check`, lalu instance dihapus lewat API Vast.ai dengan `CONTAINER_ID` / `CONTAINER_API_KEY` milik instance itu (`vastai/upload_results_and_destroy.sh`). Jika training gagal atau berhenti (exit selain 0), atau upload/verifikasi gagal, instance dibiarkan hidup.
 
-Tambahkan `--early-stop-patience N` untuk berhenti lebih awal saat metrik early stop mendatar: `vastai/zipformer_watchdog.sh` berjalan di box (sesi tmux `watchdog`, log `~/zipformer_watchdog.log`) dan memeriksa `dev_metrics.jsonl` tiap 2 menit. Metriknya adalah kunci `early_stop_metric` di config (bawaan `qdat/per_phonemes`, PER QDAT), atau `--early-stop-metric <kunci>` untuk run itu saja (lihat [Evaluasi tiap epoch](#evaluasi-tiap-epoch-augmentasi-dan-baseline)); `dev_metrics.jsonl` yang belum memuat kunci itu (mis. run lama) memakai `per_phonemes` dev lama, dan log watchdog menyebutkannya. Sebuah epoch dihitung rekor baru hanya jika metriknya lebih rendah setidaknya `--early-stop-min-improvement` (default `0.05`, relatif) dari rekor sebelumnya. Setelah N epoch berturut-turut tanpa rekor baru, watchdog mengirim SIGTERM ke training (berhenti rapi, checkpoint di-flush), mengubah `num_epochs` di config box ke epoch terakhir, lalu menjalankan ulang pipeline yang sama: averaging 3 epoch terakhir, evaluasi test, export, dan dengan `--destroy-when-done` juga upload hasil + destroy. Watchdog tidak pernah memotong averaging / eval / export (hanya bertindak selama epoch terakhir < `num_epochs`).
+Tambahkan `--early-stop-patience N` untuk berhenti lebih awal saat metrik early stop mendatar: `vastai/zipformer_watchdog.sh` berjalan di box (sesi tmux `watchdog`, log `~/zipformer_watchdog.log`) dan memeriksa `dev_metrics.jsonl` tiap 2 menit. Metriknya adalah kunci `early_stop_metric` di config (`dev_unseen/per_phonemes` di `configs/train_config.yml`; bawaan kode jika kuncinya tidak ada: `qdat/per_phonemes`), atau `--early-stop-metric <kunci>` untuk run itu saja (lihat [Evaluasi tiap epoch](#evaluasi-tiap-epoch-augmentasi-dan-baseline)); `dev_metrics.jsonl` yang belum memuat kunci itu (mis. run lama) memakai `per_phonemes` dev lama, dan log watchdog menyebutkannya. Sebuah epoch dihitung rekor baru hanya jika metriknya lebih rendah setidaknya `--early-stop-min-improvement` (default `0.05`, relatif) dari rekor sebelumnya. Setelah N epoch berturut-turut tanpa rekor baru, watchdog mengirim SIGTERM ke training (berhenti rapi, checkpoint di-flush), mengubah `num_epochs` di config box ke epoch terakhir, lalu menjalankan ulang pipeline yang sama: averaging 3 epoch terakhir, evaluasi test, export, dan dengan `--destroy-when-done` juga upload hasil + destroy. Watchdog tidak pernah memotong averaging / eval / export (hanya bertindak selama epoch terakhir < `num_epochs`).
 
 Status run kapan saja: `python vastai/zipformer_status.py` (instance dicari lewat API Vast.ai, atau `--host/--port`). Baris pertamanya `STATUS: <keadaan>`, lalu tabel metrik early stop per epoch (beserta PER dev lama) dengan hitungan early stop, PER semua eval set di epoch terakhir, menit per epoch, sisa credit dan perkiraan biaya, watchdog, GPU, dan error terakhir; `--drive` mencocokkan SHA-256 checkpoint epoch terbaru di Drive, dan `--wait` menunggu epoch baru atau perubahan status. Setelah instance di-destroy, skrip ini menampilkan isi folder hasil di Drive. Di Claude Code, `/zipformer-monitor` (`.claude/skills/zipformer-monitor`) memakai skrip ini untuk memantau run: melapor tiap epoch, mendiagnosis crash, dan memverifikasi destroy serta hasil di Drive; keputusan berhenti dan destroy tetap di watchdog dan di tangan kamu.
 
@@ -134,6 +134,32 @@ Stage:
 * `export`: ONNX streaming fp32 + int8 ke `export/`, cek bahwa decode ONNX cocok dengan PyTorch pada 5 cut test (kesesuaian argmax per frame ≥ 99 % dan PER token ONNX vs PyTorch ≤ 1 %; keduanya dicatat di log), lalu qdat_bench dengan model ONNX fp32.
 
 Exit code: `0` sukses, `143` berhenti dengan aman (mis. SIGTERM; checkpoint sudah di-flush), `1` gagal.
+
+### Patokan box dan run Vast.ai
+
+Patokan dari run v1 (2026-11-23). Ikuti ini untuk setiap run berikutnya; tiap baris berasal dari kegagalan atau biaya nyata.
+
+| Aspek | Patokan | Kenapa |
+|---|---|---|
+| GPU | 1× RTX 5090 32 GB (atau VRAM ≥ 32 GB) | `max_duration: 600` memakai ±22–30 GB VRAM |
+| **CPU** | `cpu_cores_effective` ≥ `num_workers` di config (24) | fbank, CutMix, speed perturb, reverb, dan noise dihitung on the fly di worker dataloader |
+| **RAM** | ≥ 64 GB | box 8 core / 30 GB RAM di-OOM-kill (exit 137, `oom_kill` cgroup) 4 menit setelah epoch 1 dimulai; box 48 core / 108 GB memakai ±34 GB. Launcher menolak box di bawah CPU/RAM ini di langkah [1/6] (`--skip-resource-check` untuk melewatinya) |
+| Disk | `--disk 110` cukup | data 65 GiB (tar dihapus setelah diekstrak) + environment + checkpoint (`keep_last_k: 3`): terpakai ±85 GB sampai epoch 4 |
+| Tipe sewa | on-demand, bukan interruptible (bid) | instance bid bisa direbut penyewa lain di tengah epoch; `vastai search offers` default-nya on-demand |
+| Reliability | ≥ 0.99 | host 0.971 berubah `actual_status: offline` lalu hilang dari API sebelum training mulai |
+| Download | `inet_down` ≥ 500 Mbps, perhatikan `inet_down_cost` ($/GB) | 65 GiB: ±15 menit di 590 Mbps, ±4 menit di 7.9 Gbps; dengan $0.039/GB data saja sudah ±$2.7 |
+| Credit | cek sebelum launch: ±$0.85/epoch (±73 menit/epoch di RTX 5090 + 48 core, $0.695/jam) → 30 epoch ±$26 + tahap akhir | credit yang habis mematikan box sebelum averaging/test/export; `zipformer_status.py` menandai `CREDIT TIDAK CUKUP` |
+| Metrik early stop | `dev_unseen/per_phonemes` (default config) | QDAT (159 klip) terlalu berisik, lihat [Metrik early stop](#metrik-early-stop) |
+| Zona waktu | sesi training & watchdog berjalan di WIB (`TZ=WIB-7`, di-set launcher) | log dan `zipformer_status.py` tampil WIB; shell SSH tetap UTC |
+
+Mencari offer yang memenuhi patokan (urut harga):
+
+```bash
+vastai search offers 'gpu_name=RTX_5090 num_gpus=1 reliability>0.99 verified=true rentable=true cuda_vers>=12.8 disk_space>=110 cpu_cores_effective>=24 cpu_ram>=64000 inet_down>=500' -o 'dph_total' --storage 110
+python vastai/run_zipformer_training.py --offer-id <OFFER_ID> --disk 110 --destroy-when-done --early-stop-patience 4
+```
+
+Jika `--offer-id` gagal dengan "Unknown error", jalankan `vastai show instances`: instance bisa sudah terbuat dalam status `stopped` (GPU-nya keburu disewa orang lain) dan tetap ditagih storage; hapus dengan `vastai destroy instance <ID>` sebelum mencoba offer lain. Image pytorch tidak punya `unzip` (dibutuhkan installer rclone); launcher memasangnya di langkah [2/6].
 
 ## Evaluasi tiap epoch, augmentasi, dan baseline
 
@@ -224,9 +250,9 @@ Biaya: di run v0 (RTX 5090), jeda antara log train terakhir dan baris dev, terma
 
 ### Metrik early stop
 
-`early_stop_metric` (bawaan `qdat/per_phonemes`) adalah kunci `dev_metrics.jsonl` yang diikuti aturan rekor watchdog dan `zipformer_status.py`. Pilihannya `per_phonemes` (dev lama) atau `<set>/per_phonemes` dari tabel di atas. `run_zipformer_training.py --early-stop-metric <kunci>` mengganti nilai config untuk satu run. Jika belum ada baris yang memuat kunci itu (`dev_metrics.jsonl` run lama), watchdog dan status memakai `per_phonemes` dan menyebutkannya, sehingga berkas lama tetap terbaca.
+`early_stop_metric` (`dev_unseen/per_phonemes` di `configs/train_config.yml` sejak 2026-11-23; bawaan kode `qdat/per_phonemes`) adalah kunci `dev_metrics.jsonl` yang diikuti aturan rekor watchdog dan `zipformer_status.py`. Pilihannya `per_phonemes` (dev lama) atau `<set>/per_phonemes` dari tabel di atas. `run_zipformer_training.py --early-stop-metric <kunci>` mengganti nilai config untuk satu run. Jika belum ada baris yang memuat kunci itu (`dev_metrics.jsonl` run lama), watchdog dan status memakai `per_phonemes` dan menyebutkannya, sehingga berkas lama tetap terbaca.
 
-Catatan soal QDAT sebagai metrik henti: QDAT hanya 159 klip pendek (9.241 fonem). Bootstrap per klip atas prediksi v0 memberi PER 16,0 % dengan simpangan baku 1,6 poin (±10 % relatif, CI 95 % 13,0–19,3 %), dan PER per klip sangat berekor (p90 40 %). Ambang 5 % relatif berada di bawah derau pengambilan sampel itu; selisih antar epoch pada klip yang sama lebih kecil, tetapi segelintir klip bisa menggeser rekor. Selain itu, berhenti berdasarkan QDAT berarti QDAT tidak lagi angka akhir yang netral. Alternatif yang lebih stabil adalah `dev_unseen_vol-20db/per_phonemes` atau `dev_unseen_reverb/per_phonemes` (3000 cut), dengan QDAT tetap dicatat.
+Catatan soal QDAT sebagai metrik henti: QDAT hanya 159 klip pendek (9.241 fonem). Bootstrap per klip atas prediksi v0 memberi PER 16,0 % dengan simpangan baku 1,6 poin (±10 % relatif, CI 95 % 13,0–19,3 %), dan PER per klip sangat berekor (p90 40 %). Ambang 5 % relatif berada di bawah derau pengambilan sampel itu; selisih antar epoch pada klip yang sama lebih kecil, tetapi segelintir klip bisa menggeser rekor. Selain itu, berhenti berdasarkan QDAT berarti QDAT tidak lagi angka akhir yang netral. Alternatif yang lebih stabil adalah `dev_unseen_vol-20db/per_phonemes` atau `dev_unseen_reverb/per_phonemes` (3000 cut), dengan QDAT tetap dicatat. Run v1 membuktikannya: QDAT epoch 1–4 bergerak 22,9 / 22,4 / 23,5 / 19,3 % sementara `dev_unseen` turun tiap epoch (9,7 / 5,7 / 5,0 / 4,1 %); dengan QDAT, watchdog nyaris menghentikan training setelah epoch 5 saat model masih membaik tajam. Karena itu config memakai `dev_unseen/per_phonemes` (3000 cut) dan QDAT hanya dilaporkan.
 
 ### Augmentasi
 

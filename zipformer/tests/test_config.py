@@ -108,7 +108,7 @@ def test_train_yaml_turns_on_the_new_values_under_a_new_run_name():
     assert c.speed_factor_ranges == [(0.85, 0.95), (1.0, 1.0), (1.05, 1.3)]
     assert (c.reverb_p, c.volume_p, c.volume_db, c.cutmix_snr) == (0.3, 0.6, (-40.0, 6.0), (5.0, 20.0))
     assert (c.dev_unseen_cuts_per_moshaf, c.eval_qdat) == (1000, True)
-    assert c.early_stop_metric == "qdat/per_phonemes"
+    assert c.early_stop_metric == "dev_unseen/per_phonemes"  # QDAT too noisy to stop on (README)
     assert c.use_cr_ctc is False  # comparison-run option, off in v1
     # never the finished v0 run's folders: that would "resume" at its epoch 30
     assert "v0" not in c.output_dir and "v0" not in c.rclone_checkpoint_path
