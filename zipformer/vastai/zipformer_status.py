@@ -35,7 +35,7 @@ import subprocess
 import sys
 import time
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ZIPFORMER_DIR = os.path.dirname(SCRIPT_DIR)
@@ -196,6 +196,18 @@ def eval_set_pers(row):
     return {k: v for k, v in out.items() if v is not None}
 
 
+WIB = timedelta(hours=7)
+_STAMP = re.compile(r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)(,\d+)?")
+
+
+def to_wib(text):
+    """Ganti timestamp UTC box (`YYYY-MM-DD HH:MM:SS[,ms]`) di `text` dengan WIB (UTC+7)."""
+    def shift(m):
+        t = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S") + WIB
+        return f"{t:%Y-%m-%d %H:%M:%S}{m.group(2) or ''} WIB"
+    return _STAMP.sub(shift, text)
+
+
 def epoch_hours(epoch_end_lines):
     """Rata-rata durasi 3 epoch terakhir (jam) dari timestamp 'epoch N finished'."""
     stamps = []
@@ -316,7 +328,7 @@ def print_status(args, st):
     s = st["sections"]
     print(f"STATUS: {st['state']} — {STATES[st['state']]}")
     print(f"Box: {st['host']}:{st['port']}" + (f" (instance {st['instance_id']})" if st["instance_id"] else "")
-          + f", waktu box {first(s, 'NOW')} UTC, config {first(s, 'CONFIG')}")
+          + f", waktu box {to_wib(first(s, 'NOW'))}, config {first(s, 'CONFIG')}")
 
     table, best = st["table"], st["best"]
     rule = f"rekor = < rekor x {1 - st['min_rel']:.2f}" + ("" if st["watchdog_params_known"] else " (default; watchdog tidak ditemukan)")
@@ -362,7 +374,7 @@ def print_status(args, st):
     print(f"\nWatchdog: {wd_state}")
     for l in wd:
         if l not in ("session", "running"):
-            print(f"  {l}")
+            print(f"  {to_wib(l)}")
     if first(s, "GPU"):
         print(f"GPU: {first(s, 'GPU')}")
     for key, label in (("STAGE", "Tahap terakhir"), ("ENDED", "Akhir run"), ("FINISH", "Upload/destroy"), ("ERRORS", "Error di log")):
@@ -370,7 +382,7 @@ def print_status(args, st):
         if lines:
             print(f"{label}:")
             for l in lines:
-                print(f"  {l[:220]}")
+                print(f"  {to_wib(l)[:220]}")
 
     if args.drive:
         ckpt = first(s, "CKPT_PATH")

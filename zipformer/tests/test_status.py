@@ -120,3 +120,12 @@ def test_wait_reports_no_instance_once_confirmed(monkeypatch):
 )
 def test_classify(sections, num_epochs, last, state):
     assert zs.classify(sections, num_epochs, last) == state
+
+
+def test_to_wib_shifts_box_utc_stamps_and_rolls_the_date():
+    assert zs.to_wib("2026-11-22 17:31:40") == "2026-11-23 00:31:40 WIB"
+    assert zs.to_wib("2026-11-22 17:29:39,334 INFO train_zipformer: ===== stage: prepare =====") == (
+        "2026-11-23 00:29:39,334 WIB INFO train_zipformer: ===== stage: prepare ====="
+    )
+    assert zs.to_wib("2026-11-22 10:00:00 watchdog mulai") == "2026-11-22 17:00:00 WIB watchdog mulai"
+    assert zs.to_wib("tanpa timestamp") == "tanpa timestamp"
