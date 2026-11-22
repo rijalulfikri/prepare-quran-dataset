@@ -63,6 +63,9 @@ STATES = {
 NO_INSTANCE_CONFIRMATIONS = 3
 
 # Satu panggilan SSH: bagian-bagian dipisah baris "@@NAMA"
+# Zona waktu sesi training/watchdog, ditulis launcher (tidak ada di box lama: UTC)
+REMOTE_TZ_FILE = "/root/zipformer_tz"
+
 REMOTE_PROBE = r"""
 Z=%(z)s
 LOG=/root/train_zipformer.log
@@ -78,7 +81,7 @@ out=$(val output_dir); case "$out" in /*) ;; *) out="$Z/$out" ;; esac
 # Log berisi semua run di box ini; bagian per-run dimulai dari header train_zipformer.sh terakhir
 start=$(grep -a -n 'PIPELINE TRAINING' "$LOG" 2>/dev/null | tail -1 | cut -d: -f1)
 cur() { tail -n +"${start:-1}" "$LOG" 2>/dev/null; }
-echo @@NOW; date '+%%F %%T %%z'
+echo @@NOW; TZ="$(cat /root/zipformer_tz 2>/dev/null)" date '+%%F %%T %%z'
 echo @@CONFIG; echo "$cfg"
 echo @@NUM_EPOCHS; val num_epochs
 echo @@CKPT_PATH; val rclone_checkpoint_path

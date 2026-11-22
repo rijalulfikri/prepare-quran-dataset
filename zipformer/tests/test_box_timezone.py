@@ -33,3 +33,22 @@ def test_box_tz_needs_no_tzdata():
 def test_watchdog_log_follows_the_session_timezone():
     say = next(l for l in (VASTAI / "zipformer_watchdog.sh").read_text().splitlines() if l.startswith("say()"))
     assert "date -u" not in say
+
+
+def test_status_probe_reads_the_clock_in_the_session_timezone():
+    # The ssh shell itself stays UTC; the probe must use the sessions' TZ or WIB log stamps get shifted twice
+    import zipformer_status as zs
+
+    assert rzt.REMOTE_TZ_FILE == zs.REMOTE_TZ_FILE
+    assert f'TZ="$(cat {zs.REMOTE_TZ_FILE} 2>/dev/null)" date' in zs.REMOTE_PROBE
+
+
+def test_probe_clock_with_and_without_the_tz_file(tmp_path):
+    import zipformer_status as zs
+
+    line = next(l for l in zs.REMOTE_PROBE.splitlines() if l.startswith("echo @@NOW"))
+    cmd = line.replace("%%", "%").replace(zs.REMOTE_TZ_FILE, str(tmp_path / "tz"))
+    run = lambda: subprocess.run(["bash", "-c", cmd], capture_output=True, text=True).stdout.split()[-1]
+    assert run() == "+0000"  # older box without the file: UTC, as before
+    (tmp_path / "tz").write_text(rzt.BOX_TZ + "\n")
+    assert run() == "+0700"

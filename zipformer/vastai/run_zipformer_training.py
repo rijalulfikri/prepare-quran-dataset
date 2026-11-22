@@ -100,6 +100,8 @@ REMOTE_RELAUNCH = "/root/zipformer_relaunch.sh"
 WATCHDOG_SESSION = "watchdog"
 # Zona waktu sesi training & watchdog: WIB. String POSIX, jadi tidak butuh tzdata di image
 BOX_TZ = "WIB-7"
+# Dibaca zipformer_status.py: shell SSH tetap UTC, log sesi memakai BOX_TZ
+REMOTE_TZ_FILE = "/root/zipformer_tz"
 DEFAULT_EARLY_STOP_MIN_IMPROVEMENT = 0.05
 K2_VARS = ("K2_WHEEL_URL", "K2_WHEEL_URL_CP312")
 DEFAULT_TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu128"  # sama dengan train_zipformer.sh
@@ -540,7 +542,8 @@ def launch_training(args, host, port, wait_ssh=False):
         print("  lalu jalankan ulang skrip ini.")
         sys.exit(1)
 
-    print("\n[4/6] Kirim konfigurasi rclone")
+    print("\n[4/6] Kirim konfigurasi rclone (dan zona waktu sesi)")
+    run_command(ssh + [f"echo {BOX_TZ} > {REMOTE_TZ_FILE}"], dry)
     run_command(ssh + ["mkdir -p /root/.config/rclone"], dry)
     run_command(scp + [args.rclone_conf, f"root@{host}:/root/.config/rclone/rclone.conf"], dry)
     run_command(ssh + ["chmod 600 /root/.config/rclone/rclone.conf"], dry)
