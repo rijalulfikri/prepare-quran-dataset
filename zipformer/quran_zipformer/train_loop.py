@@ -19,6 +19,7 @@ import argparse
 import json
 import logging
 import os
+import random
 import signal
 import sys
 import threading
@@ -37,6 +38,7 @@ from quran_zipformer import checkpointing as ck
 from quran_zipformer import frame_budget as fb
 from quran_zipformer.config import ZipformerTrainConfig
 from quran_zipformer.datamodule import (
+    apply_tempo,
     batch_to_tensors,
     concat_consecutive,
     cr_spec_augment,
@@ -49,7 +51,7 @@ from quran_zipformer.datamodule import (
 )
 from quran_zipformer.decode import evaluate_split
 from quran_zipformer.drive_backup import DriveBackup
-from quran_zipformer.eval_sets import LEGACY_DEV, build_eval_sets, metric_keys
+from quran_zipformer.eval_sets import LEGACY_DEV, build_eval_sets, metric_keys, wave_transforms
 from quran_zipformer.icefall_import import setup_icefall_paths
 from quran_zipformer.model import build_model
 from quran_zipformer.tokens import PhonemeTokens
@@ -475,14 +477,20 @@ def _train_batches(
                 set_batch_count(model, adjusted_batch_count(st.batch_idx_train, cfg.max_duration))
             st.batch_idx_train += 1
             feats, feat_lens, texts, cuts = batch_to_tensors(batch)
+            # seeded by the global batch index: the same draw when this batch is replayed after a resume
+            feats, feat_lens = apply_tempo(
+                cfg, feats, feat_lens, texts, random.Random(f"{cfg.seed}:tempo:{st.batch_idx_train}")
+            )
             feats, feat_lens = feats.to(device), feat_lens.to(device)
             targets, target_lengths = encode_targets(texts, tokens, device)
             parts = {}
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast):
                 if cfg.use_cr_ctc:
+                    segments = supervision_segments(batch).to(device)
+                    segments[:, 2] = feat_lens[segments[:, 0].long()]  # lengths after the tempo change
                     loss, num_frames, parts = compute_cr_ctc_loss(
                         model, feats, feat_lens, targets, target_lengths,
-                        supervision_segments(batch).to(device), cr_spec_aug, st.batch_idx_train, cfg,
+                        segments, cr_spec_aug, st.batch_idx_train, cfg,
                     )
                 else:
                     loss, num_frames = compute_ctc_loss(model, feats, feat_lens, targets, target_lengths)
@@ -568,7 +576,7 @@ def evaluate_sets(model, cfg, eval_sets: dict[str, CutSet], tokens, device) -> d
     decoded with the export chunk / left context; the legacy dev is capped at `dev_max_cuts`."""
     metrics = {}
     for name, cuts in eval_sets.items():
-        loader = eval_dataloader(cfg, cuts)
+        loader = eval_dataloader(cfg, cuts, wave_transforms=wave_transforms(name))
         try:
             m = evaluate_split(
                 model, loader, tokens, device, cfg.export_chunk_size, cfg.export_left_context,

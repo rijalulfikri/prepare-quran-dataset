@@ -45,6 +45,18 @@ def output_frames(t_fbank: int, output_downsampling_factor: int) -> int:
     return max(t, 0)
 
 
+def min_fbank_frames(text: str, output_downsampling_factor: int) -> int:
+    """Fewest fbank frames whose `output_frames` cover `required_frames(text)`; 0 for empty text."""
+    needed = required_frames(text)
+    if needed == 0:
+        return 0
+    if output_downsampling_factor == 1:
+        return 2 * needed + 7
+    if output_downsampling_factor == 2:
+        return 4 * needed + 5
+    raise ValueError(f"output_downsampling_factor must be 1 or 2, got {output_downsampling_factor}")
+
+
 def ratio(cut_duration: float, text: str, factor: int, speed: float) -> float:
     """Output frames / required frames; `inf` for empty text."""
     needed = required_frames(text)

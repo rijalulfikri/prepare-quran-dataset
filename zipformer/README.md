@@ -10,6 +10,8 @@ Semua kode training Zipformer berakar di folder `zipformer/` ini; semua path di 
 | `train_zipformer.py`, `train_zipformer.sh` | CLI per stage dan pipeline end-to-end untuk Vast.ai |
 | `prepare_zipformer_data_colab.py`, `notebooks/prepare_zipformer_data.ipynb` | persiapan data di Colab |
 | `configs/train_config.yml` | config training |
+| `infer_ayah.py`, `live_transcribe.py`, `compare_models.py` | transkripsi satu berkas, transkripsi langsung dari mikrofon, dan perbandingan dua model |
+| `robustness_audit.py` | audit ketahanan satu model ONNX terhadap model acuan (lihat [Audit ketahanan](#audit-ketahanan-v0-terhadap-model-acuan)) |
 | `requirements-zipformer.txt` | dependency training |
 | `external/icefall` | submodule icefall (`git submodule update --init external/icefall`) |
 | `tests/` | test (`pytest` dari folder ini) |
@@ -137,6 +139,55 @@ Exit code: `0` sukses, `143` berhenti dengan aman (mis. SIGTERM; checkpoint suda
 
 Model v0 (Drive: `checkpoints/utluma-zipformer-ctc-v0`, rata-rata epoch 28–30) sudah jenuh di format datanya sendiri: test PER 0,26 % (qari yang disisihkan), dev PER 0,29 %, dan kurva dev datar sejak sekitar epoch 18. Pada suara awam ia jauh lebih buruk (QDAT, 159 rekaman HP, 120 di antaranya perempuan: PER 16,0 %) dan peka terhadap volume pelan, gema, dan tempo cepat. Dev lama (10 % acak dari kumpulan latih, qari yang sama) tidak bisa melihat itu. Karena itu tiap epoch sekarang dievaluasi pada beberapa set, dan augmentasi baru menyasar kelemahan yang terukur.
 
+### Audit ketahanan v0 terhadap model acuan
+
+`robustness_audit.py` membandingkan satu model ONNX dengan model acuan pada audio yang sama. Keduanya di-decode lewat sherpa-onnx streaming dalam blok 100 ms, seperti di aplikasi. Angka di bawah adalah v0 (`export-epoch-20/model.int8.onnx`) terhadap `zipformer_p_arabic_v3.1.int8.onnx`, dijalankan 2026-11-22. PER dihitung terhadap teks Al-Qur'an dan menoleransi panjang madd yang boleh berbeda.
+
+| Kelemahan v0 | v0 | v3.1 | Jawaban di `train_config.yml` | Terlihat tiap epoch di |
+|---|---|---|---|---|
+| Bacaan bersambung: 539 ayat berurutan dari 7 qari, tiap blok sebagai satu stream | PER 4,7 % per ayat → 6,3 % satu stream; awal 269 dari 539 ayat hilang | 2,8 % → 3,2 %; 31 dari 539 (26 di satu qari) | `concat_p` dengan jeda berisi derau | `dev_unseen_pair-gap` |
+| Hal yang sama pada Al-Fatihah saja (7 qari) | 0,5 % → 6,3 %; 33 dari 49 awal ayat hilang | 0,0 % → 0,7 %; 3 dari 49 | sama | sama |
+| Derau ruangan 2–5 detik sebelum ucapan | 2,9–3,8 % | 0,3 % | `pad_p`, `nonspeech_noise_p` | `dev_unseen_lead-noise` |
+| Jeda berderau 0,5–2 detik di antara dua ucapan | 2,6–3,1 % | 0,3–0,4 % | `concat_gap_seconds` | `dev_unseen_pair-gap` |
+| Volume pelan: −20 / −30 / −40 dB | 3,3 / 22,9 / 54,2 % (pada −40 dB, 17 dari 48 keluaran hampir kosong) | 0,3 / 0,5 / 0,7 % | `volume_db: [-40, 6]`, `volume_p: 0.6` | `dev_unseen_vol-20db`, `dev_unseen_vol-35db` |
+| HP dari jauh (−30 dB, derau SNR 15, pita 300–3400 Hz) | 63,8 % | 0,8 % | gabungan volume dan CutMix | `dev_unseen_vol-35db` (hanya sisi volumenya) |
+| Mikrofon terlalu keras: gelombang terpotong pada 25 % / 10 % puncak | 2,1 / 14,8 % | 0,4 / 1,7 % | `clip_p` | `dev_unseen_clip` |
+| Tempo cepat tanpa perubahan pitch: ×1,25 / ×1,5 | 2,7 / 7,6 % | 0,5 / 1,0 % | `tempo_p` | tidak ada; hanya audit ini |
+| Speed ×1,2; pitch +4 semiton (suara lebih tinggi) | 2,9 %; 3,5 % | 0,2 %; 0,3 % | `speed_factor_ranges` sampai 1,3 | `dev_unseen_speed1.25` |
+| Gema; gema dengan tempo ×1,25 | 0,7–1,2 %; 3,8 % | 0,2–0,3 %; 0,5 % | `reverb_p`, `tempo_p` | `dev_unseen_reverb` |
+| Codec Opus 8 kbps | 4,1 % | 0,7 % | belum ada (lihat bawah) | tidak ada; hanya audit ini |
+| Rekaman HP orang awam (QDAT, 120 dari 159 perempuan) | 16,1 %; 24 klip di atas 30 % | 7,3 %; 1 klip | butuh data baru (lihat bawah) | `qdat` |
+| Panel 56 folder qari, 374 ayat | 5,3 % (3,2 % tanpa kata yang diulang qari); fonem pertama salah atau hilang di 48 ayat | 1,5 % (0,7 %); 14 ayat | butuh data baru | `dev_unseen` (3 moshaf) |
+
+v0 setara dengan acuan pada derau sesudah ucapan, volume +12 dB tanpa terpotong, pita telepon, low-pass 2 kHz, sampling 8 kHz, MP3 16 kbps, derau merah muda dan derau ruangan pada SNR 10, tempo ×0,8, dan speed ×0,85. Pada masukan tanpa ucapan (hening digital, derau putih, merah muda, dan ruangan sampai −20 dBFS) kedua model tidak mengeluarkan token. Ocehan orang lain pada SNR 5 menggagalkan keduanya (32 % dan 30 %), jadi itu bukan kelemahan khusus v0.
+
+Cara membaca angkanya:
+
+* PER di panel dan di bacaan bersambung memuat pengulangan qari. Di ayat panjang qari sering berhenti mengambil napas lalu mengulang beberapa kata, sedangkan teks rujukan memuatnya sekali (contoh: Al-Kahf 14, 16, dan 19 bacaan Husary, 42–86 "kesalahan" per ayat di kedua model). v0 selalu menuliskan pengulangan itu. v3.1 menuliskan sebagian besar, tetapi kadang melewatkannya (contoh: Yasin 14 dan 18 bacaan Hudhaify), sehingga pengulangan ikut memperlebar selisih. Karena itu laporan panel punya baris "tanpa kata yang diulang qari", yang membuang rentetan sisipan 6 fonem atau lebih (`repeated`). Tahap `stream` tidak dikoreksi; di sana yang bermakna adalah kenaikan dari per ayat ke satu stream dan jumlah awal ayat yang hilang.
+* Pada lima qari latih v0 (Husary, Minshawi, Abdul Basit, Hudhaify, Ayman Sowaid; 385 ayat, satu berkas per ayat, tanpa kata yang diulang), v0 sudah dekat dengan acuan selama ayat dibaca dalam satu napas: 0,26 % terhadap 0,06 % (263 ayat; 234 dan 254 di antaranya tanpa satu pun kesalahan). Pada ayat yang memuat jeda selisihnya melebar: 2,25 % terhadap 0,65 % (122 ayat). Jika ayat yang sama dipotong di jedanya, seperti format data latih v0, kesalahan v0 turun ke 1,61 %. Bagian itulah yang disasar `concat_p` dan `pad_p`; sisanya tidak. Ini pengukuran sekali jalan, tidak ada di `robustness_audit.py`.
+* Baterai degradasi memakai 48 ucapan 4–14 detik yang dibaca hampir benar oleh kedua model saat bersih (paling banyak dua per qari), jadi selisihnya berasal dari degradasinya.
+* Satu folder panel (`Abdullaah_3awwaad_Al-Juhaynee_128kbps`) tidak dihitung: model acuan pun salah 99 %, artinya berkasnya tidak cocok dengan nomor ayatnya. Laporan menyisihkan folder seperti itu dan menyebutkannya.
+
+Yang tidak bisa dijawab augmentasi:
+
+* **Ragam penutur.** v0 dilatih pada 23 moshaf dari ±18 qari profesional laki-laki. Pada klip QDAT yang gagal, membuang hening awal, menggeser pitch, dan menormalkan level tidak menolong (PER tetap 45–60 %). Selisih di QDAT dan di qari yang tidak dilatih butuh data baru: suara perempuan, anak, dan rekaman HP. Model acuan dilatih pada lebih dari seribu penutur.
+* **Bacaan cepat asli.** `tempo_p` meniru tempo, bukan cara membaca hadr. Moshaf `25.0` (hadr, ±17 jam) belum dipakai; memasukkannya berarti menyiapkan ulang data dan shard, dan pembagian dev ikut berubah.
+* **Codec bitrate rendah.** Meniru Opus butuh encoder di data loader. Aplikasi mengambil PCM langsung dari mikrofon, dan MP3 16 kbps serta pita telepon tidak bermasalah, jadi ini ditunda.
+
+Menjalankan audit untuk model baru (butuh `sherpa-onnx`, `librosa`, `sox`, dan `ffmpeg`; tanpa `sox` atau `ffmpeg`, kondisi yang memakainya dilewati):
+
+```bash
+python robustness_audit.py --out audit-v1 \
+    --model v1 results-zipformer-v1/export/model.int8.onnx results-zipformer-v1/export/tokens.txt \
+    --model v3.1 results-zipformer/zipformer_p_arabic_v3.1.int8.onnx results-zipformer/tokens.txt \
+    --audio-root <folder berisi <qari>/SSSAAA.mp3> \
+    --room-noise <rekaman derau ruangan.wav>
+
+python robustness_audit.py --out audit-v1 --report   # susun ulang laporan dari .jsonl yang ada
+```
+
+`--model` pertama adalah model yang diuji dan yang terakhir acuannya. Tahapnya `panel`, `qdat`, `battery`, `stream`, dan `noise` (`--stages`); tiap tahap menulis `<out>/<tahap>.jsonl`, dan `<out>/report.md` menandai baris yang tertinggal lebih dari 1 poin PER dari acuan. `qdat` memakai parquet `obadx/qdat_bench` dari cache Hugging Face atau `--qdat`. Seluruh tahap untuk dua model selesai dalam ±7 menit dengan `--jobs 7` di Mac 18 core.
+
 ### Eval set tiap epoch
 
 Set dibentuk saat training dimulai dari berkas yang sudah ada di `data_dir`. Pembagian train/dev dan shard data tidak berubah.
@@ -149,6 +200,12 @@ Set dibentuk saat training dimulai dari berkas yang sudah ada di `data_dir`. Pem
 | `dev_unseen_vol-20db` | sampel `dev_unseen` dengan volume −20 dB | `stress_sets` |
 | `dev_unseen_reverb` | sampel `dev_unseen` dengan gema simulasi tetap (bank 64 RIR dari seed `seed`, cut ke-*i* memakai RIR ke-*i* mod 64) | `stress_sets` |
 | `dev_unseen_speed1.25` | sampel `dev_unseen` dengan speed ×1,25 | `stress_sets` |
+| `dev_unseen_vol-35db` | sampel `dev_unseen` dengan volume −35 dB (mikrofon sangat pelan) | `stress_sets` |
+| `dev_unseen_clip` | sampel `dev_unseen` yang gelombangnya dipotong pada 10 % puncaknya (mikrofon terlalu keras). Cut tidak bisa menyimpan operasi ini, jadi loader set ini memakai `wave_transforms` (`eval_sets.wave_transforms`) | `stress_sets` |
+| `dev_unseen_lead-noise` | sampel `dev_unseen` dengan 2 detik derau sebelum tiap cut, 30 dB di bawah ucapan (derau ruangan sebelum qari mulai) | `stress_sets` |
+| `dev_unseen_pair-gap` | cut bertetangga dari satu moshaf digabung dua-dua melewati jeda 1 detik berisi derau (−30 dB); labelnya gabungan kedua label. Jumlah cut jadi separuh (1500), cut ganjil terakhir tiap moshaf dibuang | `stress_sets` |
+
+Derau untuk `lead-noise` dan `pair-gap` adalah derau merah muda sintetis dari `seed` (`eval_sets.noise_bank`), bukan `cuts_noise_aug`, supaya set stres tidak memakai derau yang dilatihkan.
 
 Semua set di-decode dengan jalur PyTorch yang sama (`evaluate_split`, `export_chunk_size` / `export_left_context`). Satu epoch = satu baris `dev_metrics.jsonl`; kunci dev lama tidak berubah, set lain diberi prefix:
 
@@ -163,7 +220,7 @@ TensorBoard / W&B: dev lama di `dev/*`, set lain di `eval/<set>/*`. Stage `eval`
 
 `dev_unseen` memakai qari test. Itu disengaja (qari latih hanya 17, jadi tidak ada qari yang disisihkan lagi), dengan konsekuensi: setelah memilih epoch atau config berdasarkan `dev_unseen`, `test_results.json` bukan lagi angka yang sama sekali tak tersentuh.
 
-Biaya: di run v0 (RTX 5090), jeda antara log train terakhir dan baris dev, termasuk simpan checkpoint epoch dan eval dev 2000 cut (±6 jam audio), hanya 12–17 detik per epoch, dari epoch ±57,5 menit. Set baru di `train_config.yml` berisi ±30 jam audio (3000 cut `dev_unseen` × 4 set ditambah QDAT), sehingga perkiraannya +1–1,5 menit per epoch (±2–3 %). Bank RIR dibuat sekali saat start (±1 detik), dan QDAT diunduh sekali per `data_dir`.
+Biaya: di run v0 (RTX 5090), jeda antara log train terakhir dan baris dev, termasuk simpan checkpoint epoch dan eval dev 2000 cut (±6 jam audio), hanya 12–17 detik per epoch, dari epoch ±57,5 menit. Set di `train_config.yml` berisi ±60 jam audio (3000 cut `dev_unseen` × 8 set, termasuk tujuh set stres, ditambah QDAT), sehingga perkiraannya +2–3 menit per epoch (±4–5 %). Angka ini ekstrapolasi dari kecepatan eval dev di run v0, belum diukur. Bank RIR dibuat sekali saat start (±1 detik), dan QDAT diunduh sekali per `data_dir`.
 
 ### Metrik early stop
 
@@ -177,27 +234,36 @@ Semua bawaan di `config.py` mematikan augmentasi baru, sehingga config lama meng
 
 | Field | Bawaan (= v0) | `train_config.yml` | Keterangan |
 |---|---|---|---|
-| `speed_perturb`, `speed_factor_ranges` | `true`, `[[0.9,0.9],[1.0,1.0],[1.1,1.1]]` | `[[0.85,0.95],[1.0,1.0],[1.05,1.25]]` | satu salinan statis per rentang; faktor tiap cut diambil di grid 0,05 dari seed + id cut (`copy_factors`). Rentang harus terurut dan tidak tumpang tindih |
+| `speed_perturb`, `speed_factor_ranges` | `true`, `[[0.9,0.9],[1.0,1.0],[1.1,1.1]]` | `[[0.85,0.95],[1.0,1.0],[1.05,1.3]]` | satu salinan statis per rentang; faktor tiap cut diambil di grid 0,05 dari seed + id cut (`copy_factors`). Rentang harus terurut dan tidak tumpang tindih. Speed menaikkan tempo dan pitch sekaligus |
+| `tempo_p`, `tempo_range` | `0.0`, `[1.0, 1.4]` | `0.3`, `[1.0, 1.4]` | tempo tanpa mengubah pitch: frame fbank satu batch di-resample sepanjang waktu (interpolasi linear) dengan satu faktor per batch (`tempo_stretch`, di loop training). Faktor dibatasi supaya label cut terketat di batch tetap muat di frame CTC (`apply_tempo`). Hanya ≥ 1, jadi batch tidak pernah lebih panjang dari `max_duration` |
 | `cutmix_p`, `cutmix_snr` | `0.5`, `[10, 20]` | `0.5`, `[5, 20]` | derau dicampur pada SNR seragam |
 | `reverb_p` | `0.0` | `0.3` | gema RIR simulasi Lhotse (tanpa unduhan), dikenakan pada ucapan sebelum derau |
-| `volume_p`, `volume_db` | `0.0`, `[-30, 6]` | `0.5`, `[-30, 6]` | gain seragam dalam dB, paling akhir (sesudah derau), seperti mikrofon pelan. `PerturbVolume` Lhotse mengambil faktor linear 0,125–2,0 sehingga level pelan hampir tak pernah terambil |
+| `volume_p`, `volume_db` | `0.0`, `[-30, 6]` | `0.6`, `[-40, 6]` | gain seragam dalam dB, sesudah derau, seperti mikrofon pelan. `PerturbVolume` Lhotse mengambil faktor linear 0,125–2,0 sehingga level pelan hampir tak pernah terambil |
+| `clip_p`, `clip_peak_fraction` | `0.0`, `[0.05, 0.5]` | `0.1`, `[0.05, 0.5]` | gelombang akhir dipotong keras pada sebagian dari puncaknya (`RandomClip`, lewat `wave_transforms`), seperti mikrofon yang terlalu keras |
+| `pad_p`, `pad_lead_seconds`, `pad_trail_seconds` | `0.0`, `[0.5, 4.0]`, `[0.0, 2.0]` | `0.3`, sama | bagian tanpa ucapan sebelum dan sesudah cut ucapan (`pad_non_speech`). Supervisi cut diperpanjang menutupi bagian itu, jadi frame-nya ikut dilatih (label tidak berubah) |
+| `nonspeech_noise_p`, `nonspeech_snr` | `0.75`, `[10, 45]` | sama | isi bagian tanpa ucapan itu dan jeda cut gabungan: potongan cut `cuts_noise_aug` pada SNR terhadap ucapan, selain itu hening digital (`NonSpeech`) |
+| `concat_p`, `concat_segments`, `concat_gap_seconds`, `concat_max_seconds` | `0.0`, `[2, 4]`, `[0, 0]`, `null` | `0.3`, `[2, 4]`, `[0, 1.5]`, `45` | segmen berurutan digabung jadi satu cut (lihat di bawah) |
 
-Urutan transform: gema → CutMix → gain → fbank → SpecAugment. Dengan nilai di atas, 35 % salinan tidak kena gema maupun gain, dan 17,5 % juga tanpa derau, sehingga PER bersih tetap terlatih.
+Urutan: gabung segmen → salinan speed → bagian tanpa ucapan (ketiganya menetapkan CutSet sebelum sampler) → gema → CutMix → gain → potong puncak → fbank → SpecAugment → tempo (per batch).
 
-Speed tetap berupa salinan statis, bukan transform acak sesudah batching. Akibatnya CutSet sudah tetap sebelum sampler, durasi batch tetap menghormati `max_duration` (memori GPU), dan resume tetap tepat. Kelayakan frame CTC (`L + R`) dicek per salinan pada faktor yang benar-benar dikenakan; cut yang hanya tidak muat pada salinan tercepatnya tetap memakai salinan lainnya (`dropped_cuts.json` mencatat id salinan). `max_dropped_fraction` dihitung atas salinan train ditambah cut dev. Di data saat ini rasio frame minimum pada speed 1,1 adalah 2,9, jadi pada 1,25 (±2,6) tidak ada yang terbuang. Rata-rata `1/faktor` turun dari 3,020 ke 2,986 jam audio per jam data, sehingga epoch ±1,1 % lebih pendek (±14,26 ribu batch dari ±14,43 ribu). Jadwal LR Eden (per batch dan per epoch) praktis tidak berubah.
+Bagian tanpa ucapan ditetapkan sebelum batching, seperti speed, sehingga durasi batch sudah menghitungnya dan resume tetap tepat. Panjangnya diambil ulang tiap epoch dari seed (`seed`, epoch, id cut): berbeda antar epoch, sama saat epoch yang sama dilanjutkan. Dengan `pad_p` 0,3 dan rata-rata ±3,25 detik per cut yang kena, audio per epoch bertambah paling banyak ±10 % (dihitung untuk cut rata-rata ±9 detik; cut gabungan lebih panjang, jadi persentasenya lebih kecil). Tempo memendekkan 30 % batch rata-rata ±16 %. Perkiraan bersihnya epoch ±5 % lebih lama daripada tanpa keduanya. Ini hitungan di atas kertas, belum diukur di GPU.
+
+Speed tetap berupa salinan statis, bukan transform acak sesudah batching. Akibatnya CutSet sudah tetap sebelum sampler, durasi batch tetap menghormati `max_duration` (memori GPU), dan resume tetap tepat. Kelayakan frame CTC (`L + R`) dicek per salinan pada faktor yang benar-benar dikenakan; cut yang hanya tidak muat pada salinan tercepatnya tetap memakai salinan lainnya (`dropped_cuts.json` mencatat id salinan). `max_dropped_fraction` dihitung atas salinan train ditambah cut dev. Di data saat ini rasio frame minimum pada speed 1,1 adalah 2,9, jadi pada 1,3 (±2,45) tidak ada yang terbuang. Rata-rata `1/faktor` turun dari 3,020 ke 2,969 jam audio per jam data, sehingga dari speed saja epoch ±1,7 % lebih pendek (±14,19 ribu batch dari ±14,43 ribu, sebelum bagian tanpa ucapan dihitung). Jadwal LR Eden (per batch dan per epoch) praktis tidak berubah.
 
 Resume: sampler tetap melanjutkan tepat di batch berikutnya dengan isi cut yang sama. Dengan CutMix aktif, urutan cut *di dalam* sebuah batch bisa berbeda setelah resume (CutMix mem-pad cut yang dicampur, dataset mengurutkan batch per durasi, dan RNG CutMix mulai ulang). Ini sudah berlaku di v0; tes lama memakai cut berdurasi sama sehingga tidak terlihat.
 
 Tidak dikerjakan:
 
-* Tempo: `PerturbTempo` Lhotse memakai `torchaudio.sox_effects`, yang tidak ada lagi di torchaudio 2.9+ (sudah dicek di 2.11). Rentang speed yang lebih lebar menggantikannya.
+* Tempo di gelombang: `PerturbTempo` Lhotse memakai `torchaudio.sox_effects`, yang tidak ada lagi di torchaudio 2.9+ (sudah dicek di 2.11). Tempo dikerjakan di frame fbank (`tempo_p` di atas), yang tidak butuh sox dan tidak menambah kerja data loader.
 * Geser pitch: `torchaudio.functional.pitch_shift` butuh ±0,36 detik per klip 12 detik (1 thread). Pada p 0,3 itu ±5 detik per batch per worker, setara dengan anggaran ±5,8 detik per batch per worker (24 worker, ±0,24 detik per langkah GPU), sehingga data loader akan menjadi leher botol. Gema pada p 0,3 hanya menambah ±0,3 detik per batch per worker (±19 ms per klip).
 
-### Gabungan segmen dan CR-CTC (run pembanding, mati di v1)
+### Gabungan segmen (nyala di v1) dan CR-CTC (run pembanding)
 
-Dua opsi tambahan, keduanya mati secara bawaan dan juga di `train_config.yml`, supaya v1 tetap mengukur augmentasi di atas saja. Nyalakan di run terpisah lalu bandingkan `dev_metrics.jsonl`-nya dengan v1.
+**Gabungan segmen berurutan** (`concat_p`, `concat_segments`, `concat_gap_seconds`, `concat_max_seconds`) nyala di `train_config.yml`. Semula opsi ini disiapkan untuk run pembanding; audit ketahanan menunjukkan ia menjawab kelemahan terbesar v0 (awal ayat hilang setelah jeda di bacaan bersambung), jadi sekarang bagian dari v1. Untuk mengukur efeknya sendiri, latih salinan config dengan `concat_p: 0.0`.
 
-**Gabungan segmen berurutan** (`concat_p`, `concat_segments`, `concat_gap_seconds`). Aplikasi mendengar bacaan bersambung, sedangkan data latih berisi potongan per jeda. `concat_consecutive` menggabungkan 2–4 segmen yang berurutan (moshaf dan surah sama, `segment_index` bersebelahan) menjadi satu cut. Labelnya adalah label segmen yang disambung tanpa pemisah; tiap label sudah berakhir dalam bentuk waqf, sesuai yang dibaca karena segmen dipotong di jeda qari. Segmen yang digabung menggantikan aslinya, jadi audio per epoch tetap sama. Pengelompokan diambil dari `seed` atas urutan (moshaf, surah, posisi), sehingga sama di setiap epoch dan proses, tidak bergantung pada urutan manifest, dan resume tetap tepat. Salinan speed, cek frame CTC, gema, CutMix, dan gain dikenakan pada cut gabungan. Manifest tidak menyimpan stempel waktu, jadi panjang jeda asli tidak bisa dipulihkan. Segmen moshaf 6.0 sudah membawa ±0,5 detik hening di tiap ujung, sedangkan moshaf 19.0 tidak; `concat_gap_seconds` menambah hening di tiap sambungan (bawaan 0). Cut gabungan bisa mencapai empat kali panjang segmen terpanjang. Encoder kausal dengan konteks kiri terbatas membuat memorinya linear terhadap durasi, tetapi batch berisi lebih sedikit cut.
+Aplikasi mendengar bacaan bersambung, sedangkan data latih berisi potongan per jeda. `concat_consecutive` menggabungkan 2–4 segmen yang berurutan (moshaf dan surah sama, `segment_index` bersebelahan) menjadi satu cut. Labelnya adalah label segmen yang disambung tanpa pemisah; tiap label sudah berakhir dalam bentuk waqf, sesuai yang dibaca karena segmen dipotong di jeda qari. Segmen yang digabung menggantikan aslinya, jadi ucapan per epoch tetap sama. Pengelompokan diambil dari `seed` atas urutan (moshaf, surah, posisi), sehingga sama di setiap epoch dan proses, tidak bergantung pada urutan manifest, dan resume tetap tepat. Salinan speed, cek frame CTC, bagian tanpa ucapan, gema, CutMix, dan gain dikenakan pada cut gabungan. Manifest tidak menyimpan stempel waktu, jadi panjang jeda asli tidak bisa dipulihkan. Segmen moshaf 6.0 sudah membawa ±0,5 detik hening di tiap ujung, sedangkan moshaf 19.0 tidak; `concat_gap_seconds` menambah jeda di tiap sambungan (v1: 0–1,5 detik), yang diisi derau atau hening digital seperti bagian tanpa ucapan (`nonspeech_noise_p`, `nonspeech_snr`). `concat_max_seconds` (v1: 45) menghentikan penggabungan sebelum ucapan cut gabungan melewati batas itu; tanpa batas, cut gabungan bisa mencapai empat kali panjang segmen terpanjang. Segmen tunggal yang lebih panjang dari batas itu tetap dipakai apa adanya. Dengan `concat_p` 0,3 kira-kira separuh segmen berada di dalam cut gabungan.
+
+**CR-CTC** mati secara bawaan dan juga di `train_config.yml`. Nyalakan di run terpisah lalu bandingkan `dev_metrics.jsonl`-nya dengan v1.
 
 **CR-CTC** (`use_cr_ctc`, `cr_loss_scale`, `cr_time_mask_ratio`, `cr_warm_steps`), mengikuti `forward_cr_ctc` icefall:
 
@@ -218,10 +284,7 @@ cp configs/train_config.yml configs/train_config_v1b.yml
 #   hub_model_id, wandb_project_name), lalu
 #   use_cr_ctc: true
 #   max_duration: 300
-#   concat_p: 0.3          # opsional; tanpa ini yang diukur hanya CR-CTC
 ```
-
-Untuk memisahkan efek keduanya, jalankan CR-CTC dan gabungan segmen di run yang berbeda.
 
 ### Baseline checkpoint lama
 
@@ -240,6 +303,8 @@ python vastai/run_zipformer_training.py --offer-id <OFFER_ID> --config configs/e
 ```
 
 Hasilnya `results-zipformer-v0-baseline/eval_sets/<checkpoint>.json`, dengan kunci yang sama dengan `dev_metrics.jsonl`; dengan `--destroy-when-done` diunggah ke `.../utluma-zipformer-ctc-v0-baseline-results`. Angka pemeriksa untuk `averaged-3.pt`: dev ±0,29 % (epoch 28–30 tercatat 0,29–0,32 %), dan QDAT ±16,0 %. Jalur ONNX v0 memberi 16,03 %; skor ulang prediksi itu dengan tokenisasi dan label tanpa spasi yang dipakai di sini juga 16,03 %. Jika QDAT jauh dari 16 %, curigai decode audio atau label. Test set penuh (0,26 %) tidak termasuk `evalsets`; jalankan `--stage eval` dengan `averaged-3.pt` di `output_dir` jika perlu.
+
+`eval_baseline_v0.yml` memuat tujuh set stres yang sama dengan `train_config.yml`. Baseline yang dijalankan sebelum `vol-35db`, `clip`, `lead-noise`, dan `pair-gap` ditambahkan tidak punya keempat kunci itu; jalankan ulang `--stage evalsets` supaya v1 punya pembanding v0 di tiap set.
 
 ## 4. Lokasi output
 
@@ -301,6 +366,6 @@ Model ini mengeluarkan **satu frame per 20 ms** (`output_downsampling_factor: 1`
 Dampak di sherpa-onnx (diverifikasi pada sherpa-onnx `347ec76`, `sherpa-onnx/csrc/online-recognizer-ctc-impl.h`):
 
 * **Teks hasil pengenalan tidak terpengaruh.** sherpa-onnx memakai berapa pun frame output yang dikembalikan model per chunk.
-* `GetResult` meng-hard-code `frame_shift_ms = 10` dan `subsampling_factor = 4`, sehingga **timestamp token 2× terlalu besar**. Bagi 2 di aplikasi, atau baca `output_frame_shift_ms` dari metadata model.
+* `GetResult` meng-hard-code `frame_shift_ms = 10` dan `subsampling_factor = 4`, sehingga **timestamp token 2× terlalu besar**. Bagi 2 di aplikasi, atau baca `output_frame_shift_ms` dari metadata model. `infer_ayah.py --times` sudah melakukannya (`sherpa_time_scale`): timestamp sherpa dikalikan `output_frame_shift_ms / 40`, dan model tanpa metadata itu (v3) tidak diubah.
 * `IsEndpoint` juga mengalikan trailing blank frame dengan angka 4 yang sama, sehingga trailing silence terhitung 2× dan aturan endpoint terpicu setelah setengah dari silence yang dikonfigurasi. Gandakan nilai `rule1_min_trailing_silence`, `rule2_min_trailing_silence`, dan `rule3_min_trailing_silence` di konfigurasi aplikasi untuk mengompensasi.
 * Tidak ada key metadata yang mengubah perilaku ini di sherpa-onnx saat ini. ONNX kita tetap membawa metadata `output_frame_shift_ms` (`20`), `subsampling_factor` (`2`) dan `output_downsampling_factor` untuk aplikasi yang membacanya.

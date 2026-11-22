@@ -40,6 +40,19 @@ def test_metadata_survives_int8(tmp_path, tiny_model, tokens):
         assert md["subsampling_factor"] == "2"
 
 
+@pytest.mark.parametrize("factor, scale", [(1, 0.5), (2, 1.0)])
+def test_sherpa_timestamps_are_rescaled_to_the_export_frame_shift(tmp_path, tiny_cfg_factory, tokens, factor, scale):
+    """sherpa-onnx counts 40 ms per output frame; a 20 ms export needs its times halved."""
+    import infer_ayah
+    from quran_zipformer.model import build_model
+
+    model = build_model(tiny_cfg_factory(output_downsampling_factor=factor), 44).eval()
+    paths = ex.export_streaming_onnx(
+        model, tmp_path, tokens, chunk_size=8, left_context=32, output_downsampling_factor=factor
+    )
+    assert infer_ayah.sherpa_time_scale(paths["int8"]) == scale
+
+
 def test_decoder_refuses_model_without_frame_shift(tmp_path, tiny_model, tokens):
     import onnx
 

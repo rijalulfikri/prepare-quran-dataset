@@ -93,7 +93,8 @@ volume_db: [-30.0, 6.0]
 # ---- per-epoch eval sets (one dev_metrics.jsonl row per epoch, see README) ----
 dev_unseen_cuts_per_moshaf: 1000   # fixed sample of cuts_test (moshaf 19.0, 29.0, 30.0)
 eval_qdat: true                # obadx/qdat_bench, 159 phone clips, eval only
-stress_sets: ["vol-20db", "reverb", "speed1.25"]   # perturbed copies of the dev_unseen sample
+# perturbed copies of the dev_unseen sample, one per weakness (eval_sets.py)
+stress_sets: ["vol-20db", "vol-35db", "reverb", "speed1.25", "clip", "lead-noise", "pair-gap"]
 early_stop_metric: "qdat/per_phonemes"   # key the watchdog's new-best rule follows
 
 # ---- eval / export ----

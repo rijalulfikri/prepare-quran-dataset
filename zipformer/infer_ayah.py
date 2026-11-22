@@ -214,6 +214,24 @@ def transcribe_sherpa(model: Path, tokens: Path, wav, num_threads: int = 2):
     return result.text, list(zip(result.tokens, result.timestamps))
 
 
+SHERPA_FRAME_SHIFT_MS = 40  # sherpa-onnx's online CTC timestamps assume 40 ms output frames
+
+
+def sherpa_time_scale(model: Path) -> float:
+    """Factor that turns sherpa-onnx's timestamps of `model` into seconds.
+
+    sherpa-onnx counts 40 ms per output frame (as zipformer_p-arabic-v3); this
+    repo's export may emit 20 ms frames (`output_downsampling_factor: 1`) and
+    says so in its `output_frame_shift_ms` metadata, so its timestamps come out
+    twice too large. 1.0 for models without that metadata.
+    """
+    import onnxruntime as ort
+
+    meta = ort.InferenceSession(str(model), providers=["CPUExecutionProvider"]).get_modelmeta().custom_metadata_map
+    shift = meta.get("output_frame_shift_ms")
+    return int(shift) / SHERPA_FRAME_SHIFT_MS if shift else 1.0
+
+
 def phoneme_error_rate(hyp: str, ref: str) -> float:
     """Character-level PER, capped at the reference length like `decode.per`.
 
@@ -233,6 +251,9 @@ def main(argv: list[str] | None = None) -> int:
         tokens_txt = Path(args.tokens) if args.tokens else checkpoint.parent / "tokens.txt"
         wav = load_wav_16k(Path(args.audio))
         hyp, times = transcribe_sherpa(checkpoint, tokens_txt, wav)
+        if args.times:
+            scale = sherpa_time_scale(checkpoint)
+            times = [(ph, t * scale) for ph, t in times]
         duration = len(wav) / 16000
         mode = f"sherpa-onnx (chunking baked into the model), tokens {tokens_txt}"
     else:

@@ -159,6 +159,16 @@ DATA_REMOTE="$(read_cfg rclone_remote_path)"
 CKPT_REMOTE="$(read_cfg rclone_checkpoint_path)"
 OUTPUT_DIR="$(read_cfg output_dir)"
 
+# Config divalidasi di sini, sebelum data diunduh. Key yang tidak dikenal kode ini
+# (salah ketik, atau config lebih baru daripada checkout) adalah error: tanpa cek ini
+# key itu dibuang diam-diam dan training berjalan tanpa augmentasi yang diminta.
+echo "Augmentasi terhadap kelemahan v0 (README: Audit ketahanan) menurut $CONFIG_FILE:"
+python -c "
+import sys
+from quran_zipformer.config import ZipformerTrainConfig
+print('\n'.join(ZipformerTrainConfig.from_yaml(sys.argv[1]).robustness_summary()))
+" "$CONFIG_FILE"
+
 echo "Cek koneksi ke remote ${DATA_REMOTE%%:*}: ..."
 rclone lsd "${DATA_REMOTE%%:*}:"
 
@@ -222,3 +232,6 @@ case "$EXPORT_DIR" in
     *) EXPORT_ABS="$PWD/${EXPORT_DIR#./}" ;;
 esac
 echo "scp -P <PORT> -r root@<IP_VAST_AI>:$EXPORT_ABS ./"
+echo "Lalu, di komputer lokal, bandingkan dengan model acuan pada audio nyata (README: Audit ketahanan):"
+echo "  python robustness_audit.py --out audit --model baru <export>/model.int8.onnx <export>/tokens.txt \\"
+echo "      --model acuan <model acuan>.onnx <tokens acuan>.txt --audio-root <folder qari>"

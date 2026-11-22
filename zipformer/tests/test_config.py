@@ -100,16 +100,32 @@ def test_defaults_are_the_v0_pipeline():
     assert (c.dev_unseen_cuts_per_moshaf, c.eval_qdat, c.stress_sets) == (0, False, [])
     assert c.early_stop_metric == "qdat/per_phonemes"
     assert (c.concat_p, c.use_cr_ctc) == (0.0, False)
+    assert (c.pad_p, c.clip_p, c.tempo_p, c.concat_max_seconds) == (0.0, 0.0, 0.0, None)
 
 
 def test_train_yaml_turns_on_the_new_values_under_a_new_run_name():
     c = ZipformerTrainConfig.from_yaml(YAML)
-    assert c.speed_factor_ranges == [(0.85, 0.95), (1.0, 1.0), (1.05, 1.25)]
-    assert (c.reverb_p, c.volume_p, c.volume_db, c.cutmix_snr) == (0.3, 0.5, (-30.0, 6.0), (5.0, 20.0))
+    assert c.speed_factor_ranges == [(0.85, 0.95), (1.0, 1.0), (1.05, 1.3)]
+    assert (c.reverb_p, c.volume_p, c.volume_db, c.cutmix_snr) == (0.3, 0.6, (-40.0, 6.0), (5.0, 20.0))
     assert (c.dev_unseen_cuts_per_moshaf, c.eval_qdat) == (1000, True)
-    assert c.stress_sets == ["vol-20db", "reverb", "speed1.25"]
     assert c.early_stop_metric == "qdat/per_phonemes"
-    assert (c.concat_p, c.use_cr_ctc) == (0.0, False)  # comparison-run options, off in v1
+    assert c.use_cr_ctc is False  # comparison-run option, off in v1
+    # never the finished v0 run's folders: that would "resume" at its epoch 30
+    assert "v0" not in c.output_dir and "v0" not in c.rclone_checkpoint_path
+
+
+def test_train_yaml_answers_every_weakness_of_the_robustness_audit():
+    """One augmentation and one per-epoch stress set per weakness measured in v0."""
+    c = ZipformerTrainConfig.from_yaml(YAML)
+    # words lost after non-speech: at the start of a stream and after a pause inside it
+    assert c.pad_p > 0 and c.pad_lead_seconds[1] >= 2.0 and c.nonspeech_noise_p > 0
+    assert c.concat_p > 0 and c.concat_gap_seconds[1] > 0 and c.concat_max_seconds is not None
+    # quiet and overdriven microphones
+    assert c.volume_p > 0 and c.volume_db[0] <= -40 and c.clip_p > 0
+    # fast recitation, with and without a higher pitch
+    assert c.tempo_p > 0 and c.tempo_range[1] >= 1.4 and c.speed_factor_ranges[-1][1] >= 1.3
+    assert c.reverb_p > 0
+    assert c.stress_sets == ["vol-20db", "vol-35db", "reverb", "speed1.25", "clip", "lead-noise", "pair-gap"]
     # never the finished v0 run's folders: that would "resume" at its epoch 30
     assert "v0" not in c.output_dir and "v0" not in c.rclone_checkpoint_path
 
@@ -158,6 +174,18 @@ def test_new_fields_survive_a_yaml_round_trip(tmp_path):
         {"cr_loss_scale": -0.1},
         {"cr_time_mask_ratio": 0.0},
         {"cr_warm_steps": 0},
+        {"concat_max_seconds": 0.0},
+        {"pad_p": 1.2},
+        {"pad_lead_seconds": (2.0, 1.0)},
+        {"pad_trail_seconds": (-1.0, 1.0)},
+        {"nonspeech_noise_p": -0.5},
+        {"nonspeech_snr": (40.0, 10.0)},
+        {"clip_p": 2.0},
+        {"clip_peak_fraction": (0.0, 0.5)},
+        {"clip_peak_fraction": (0.5, 1.5)},
+        {"tempo_p": 1.1},
+        {"tempo_range": (0.8, 1.2)},  # slowing down would lengthen a batch past max_duration
+        {"tempo_range": (1.4, 1.2)},
     ],
 )
 def test_augmentation_and_eval_validation(bad):

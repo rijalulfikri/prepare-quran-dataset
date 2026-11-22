@@ -11,7 +11,12 @@ generalisation. The sets here are built at training time from files already in
   labels = `phonetic_transcript` without spaces, as qdat_bench's own scorer.
   Evaluation only; never trained on. Cached under `data_dir/eval_qdat/`.
 - `dev_unseen_<stress>`: the same `dev_unseen` sample with one deterministic
-  perturbation each (`STRESS`).
+  perturbation each (`STRESS`). Each one measures a weakness found in v0
+  against the reference model (README, "Audit ketahanan"): quiet input
+  (`vol-20db`, `vol-35db`), reverb, fast recitation (`speed1.25`), an
+  overdriven microphone (`clip`), room noise before the recitation starts
+  (`lead-noise`) and a pause inside the stream (`pair-gap`: two cuts of one
+  reciter joined across a noisy gap, the label being both labels).
 
 Set names become key prefixes in dev_metrics.jsonl (`qdat/per_phonemes`);
 the legacy dev metrics keep their unprefixed keys.
@@ -33,7 +38,7 @@ from lhotse import CutSet, MonoCut, Recording
 
 from quran_zipformer import frame_budget as fb
 from quran_zipformer.config import ZipformerTrainConfig
-from quran_zipformer.datamodule import load_cuts
+from quran_zipformer.datamodule import FixedClip, NonSpeech, _join, load_cuts, with_non_speech
 from quran_zipformer.tokens import PhonemeTokens
 
 log = logging.getLogger(__name__)
@@ -45,10 +50,41 @@ QDAT_DATASET = "obadx/qdat_bench"
 QDAT_DIR = "eval_qdat"
 QDAT_MANIFEST = "cuts_qdat.jsonl.gz"
 STRESS_VOLUME_DB = -20.0
+STRESS_QUIET_DB = -35.0
 STRESS_SPEED = 1.25
+STRESS_CLIP_FRACTION = 0.1  # of the cut's peak
+STRESS_LEAD_SECONDS = 2.0
+STRESS_GAP_SECONDS = 1.0
+STRESS_NONSPEECH_SNR = 30.0  # speech over the noise before it / in the gap, dB
+CLIP = "clip"
+PAIR_GAP = "pair-gap"
+LEAD_NOISE = "lead-noise"
 
 
 STRESS_RIR_BANK = 64
+STRESS_NOISE_BANK = 16
+STRESS_NOISE_SECONDS = 6.0
+
+
+def noise_bank(seed: int, n: int = STRESS_NOISE_BANK) -> list[MonoCut]:
+    """`n` in-memory pink-noise cuts, identical for the same seed.
+
+    Synthetic on purpose: the training augmentation draws from `cuts_noise_aug`,
+    so these stress sets do not reuse the noise a model was trained on.
+    """
+    rng = np.random.default_rng(seed)
+    num = round(STRESS_NOISE_SECONDS * 16000)
+    bank = []
+    for k in range(n):
+        spectrum = np.fft.rfft(rng.standard_normal(num))
+        spectrum[1:] /= np.sqrt(np.arange(1, len(spectrum)))
+        wav = np.fft.irfft(spectrum, n=num)
+        wav = 0.1 * wav / np.sqrt(np.mean(wav**2))
+        buf = io.BytesIO()
+        sf.write(buf, wav.astype("float32"), 16000, format="WAV", subtype="FLOAT")
+        rec = Recording.from_bytes(buf.getvalue(), recording_id=f"stress_noise_{seed}_{k}")
+        bank.append(MonoCut(id=rec.id, start=0.0, duration=rec.duration, channel=0, recording=rec, supervisions=[]))
+    return bank
 
 
 def rir_bank(seed: int, n: int = STRESS_RIR_BANK) -> list[Recording]:
@@ -92,7 +128,54 @@ def _stress_speed(cut: MonoCut, i: int, rirs: list[Recording]) -> MonoCut:
     return cut.perturb_speed(STRESS_SPEED)
 
 
-STRESS = {"vol-20db": _stress_volume, "reverb": _stress_reverb, "speed1.25": _stress_speed}
+def _stress_quiet(cut: MonoCut, i: int, rirs: list[Recording]) -> MonoCut:
+    return cut.perturb_volume(factor=10 ** (STRESS_QUIET_DB / 20))
+
+
+def _stress_clip(cut: MonoCut, i: int, rirs: list[Recording]) -> MonoCut:
+    return cut  # clipped as a waveform by the loader, see `wave_transforms`
+
+
+STRESS = {
+    "vol-20db": _stress_volume,
+    "vol-35db": _stress_quiet,
+    "reverb": _stress_reverb,
+    "speed1.25": _stress_speed,
+    CLIP: _stress_clip,
+}
+
+
+def _fixed_nonspeech(seed: int) -> NonSpeech:
+    return NonSpeech(noise_bank(seed), noise_p=1.0, snr=(STRESS_NONSPEECH_SNR, STRESS_NONSPEECH_SNR))
+
+
+def lead_noise_cuts(cuts: CutSet, seed: int) -> CutSet:
+    """Every cut with `STRESS_LEAD_SECONDS` of noise before it (ids kept)."""
+    nonspeech = _fixed_nonspeech(seed)
+    return CutSet.from_cuts(
+        with_non_speech(cut, STRESS_LEAD_SECONDS, 0.0, nonspeech, random.Random(f"{seed}:{LEAD_NOISE}:{cut.id}"))
+        for cut in cuts
+    )
+
+
+def pair_gap_cuts(cuts: CutSet, seed: int) -> CutSet:
+    """Neighbouring cuts of one moshaf joined two by two across a noisy gap of
+    `STRESS_GAP_SECONDS`; a moshaf's odd last cut is left out."""
+    nonspeech = _fixed_nonspeech(seed)
+    by_moshaf: dict[str, list[MonoCut]] = defaultdict(list)
+    for cut in cuts:
+        by_moshaf[_moshaf(cut)].append(cut)
+    out = []
+    for moshaf in sorted(by_moshaf):
+        group = by_moshaf[moshaf]
+        for a, b in zip(group[::2], group[1::2]):
+            out.append(_join([a, b], [STRESS_GAP_SECONDS], nonspeech, random.Random(f"{seed}:{PAIR_GAP}:{a.id}")))
+    return CutSet.from_cuts(out)
+
+
+def wave_transforms(set_name: str) -> list:
+    """Waveform functions the loader of `set_name` applies (perturbations a cut cannot hold)."""
+    return [FixedClip(STRESS_CLIP_FRACTION)] if set_name == f"{DEV_UNSEEN}_{CLIP}" else []
 
 
 def _moshaf(cut: MonoCut) -> str:
@@ -122,7 +205,12 @@ def dev_unseen_cuts(cfg: ZipformerTrainConfig, data_dir: Path) -> CutSet:
 
 
 def stress_cuts(cuts: CutSet, name: str, seed: int) -> CutSet:
-    """`cuts` with the `STRESS[name]` perturbation (ids get Lhotse's suffix)."""
+    """`cuts` with the perturbation `name` (Lhotse's id suffix where it adds one;
+    `pair-gap` returns half as many, joined, cuts)."""
+    if name == LEAD_NOISE:
+        return lead_noise_cuts(cuts, seed)
+    if name == PAIR_GAP:
+        return pair_gap_cuts(cuts, seed)
     rirs = rir_bank(seed) if name == "reverb" else []
     return CutSet.from_cuts(STRESS[name](cut, i, rirs) for i, cut in enumerate(cuts))
 

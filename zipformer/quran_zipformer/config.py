@@ -8,8 +8,17 @@ import yaml
 from pydantic import BaseModel, model_validator
 
 SPEED_STEP = 0.05  # grid of drawn speed factors: few distinct factors, few cached resamplers
-StressSet = Literal["vol-20db", "reverb", "speed1.25"]
+StressSet = Literal["vol-20db", "vol-35db", "reverb", "speed1.25", "clip", "lead-noise", "pair-gap"]
 _METRIC_KEY = re.compile(r"(per_phonemes|[\w.\-]+/per_phonemes)")
+# (field that turns the augmentation on, weakness of v0 it answers, fields shown with it)
+ROBUSTNESS_AUGMENTATION = (
+    ("pad_p", "kata awal hilang setelah noise sebelum bacaan", ("pad_lead_seconds", "nonspeech_snr")),
+    ("concat_p", "awal ayat hilang setelah jeda (bacaan bersambung)", ("concat_gap_seconds", "concat_max_seconds")),
+    ("volume_p", "mikrofon pelan", ("volume_db",)),
+    ("clip_p", "mikrofon terlalu keras (clipping)", ("clip_peak_fraction",)),
+    ("tempo_p", "bacaan cepat", ("tempo_range",)),
+    ("reverb_p", "gema", ()),
+)
 
 
 class ZipformerTrainConfig(BaseModel):
@@ -77,7 +86,24 @@ class ZipformerTrainConfig(BaseModel):
     # continuous recitation); a run starts at a cut with probability concat_p
     concat_p: float = 0.0
     concat_segments: tuple[int, int] = (2, 4)  # segments per joined cut, drawn uniformly
-    concat_gap_seconds: tuple[float, float] = (0.0, 0.0)  # extra silence at each join
+    concat_gap_seconds: tuple[float, float] = (0.0, 0.0)  # extra non-speech at each join
+    concat_max_seconds: float | None = None  # a run stops growing before the joined cut gets longer
+    # Non-speech before / after a speech cut (the app hears the room before the reciter
+    # starts and after he stops); durations drawn uniformly per cut and epoch
+    pad_p: float = 0.0
+    pad_lead_seconds: tuple[float, float] = (0.5, 4.0)
+    pad_trail_seconds: tuple[float, float] = (0.0, 2.0)
+    # What fills those stretches and the gaps of joined segments: a piece of a
+    # cuts_noise_aug cut at an SNR drawn from nonspeech_snr, else digital silence
+    nonspeech_noise_p: float = 0.75
+    nonspeech_snr: tuple[float, float] = (10.0, 45.0)
+    # Hard clipping of the finished waveform at a fraction of its peak (overdriven microphone)
+    clip_p: float = 0.0
+    clip_peak_fraction: tuple[float, float] = (0.05, 0.5)
+    # Tempo change without pitch change: the batch's fbank frames are resampled along
+    # time by one factor per batch (>= 1 only: faster recitation, never a longer batch)
+    tempo_p: float = 0.0
+    tempo_range: tuple[float, float] = (1.0, 1.4)
 
     # --- loss ---
     # CR-CTC (icefall): two SpecAugment views of each batch, CTC on both plus a
@@ -151,10 +177,22 @@ class ZipformerTrainConfig(BaseModel):
             raise ValueError(f"concat_gap_seconds must be (low, high) with 0 <= low <= high, got {(low, high)}")
         if self.cr_loss_scale < 0 or self.cr_time_mask_ratio <= 0 or self.cr_warm_steps < 1:
             raise ValueError("cr_loss_scale must be >= 0, cr_time_mask_ratio > 0 and cr_warm_steps >= 1")
-        for name in ("reverb_p", "volume_p", "cutmix_p", "concat_p"):
+        if self.concat_max_seconds is not None and self.concat_max_seconds <= 0:
+            raise ValueError("concat_max_seconds must be > 0 or null")
+        for name in ("pad_lead_seconds", "pad_trail_seconds"):
+            low, high = getattr(self, name)
+            if not 0 <= low <= high:
+                raise ValueError(f"{name} must be (low, high) with 0 <= low <= high, got {(low, high)}")
+        low, high = self.clip_peak_fraction
+        if not 0 < low <= high <= 1:
+            raise ValueError(f"clip_peak_fraction must be (low, high) with 0 < low <= high <= 1, got {(low, high)}")
+        low, high = self.tempo_range
+        if not 1.0 <= low <= high <= 2.0:
+            raise ValueError(f"tempo_range must be (low, high) with 1 <= low <= high <= 2, got {(low, high)}")
+        for name in ("reverb_p", "volume_p", "cutmix_p", "concat_p", "pad_p", "nonspeech_noise_p", "clip_p", "tempo_p"):
             if not 0 <= getattr(self, name) <= 1:
                 raise ValueError(f"{name} must be in [0, 1]")
-        for name in ("volume_db", "cutmix_snr"):
+        for name in ("volume_db", "cutmix_snr", "nonspeech_snr"):
             low, high = getattr(self, name)
             if low > high:
                 raise ValueError(f"{name} must be (low, high) with low <= high, got {(low, high)}")
@@ -194,11 +232,34 @@ class ZipformerTrainConfig(BaseModel):
                 "requires for cnn_module_kernel / downsampling_factor"
             )
 
+    def robustness_summary(self) -> list[str]:
+        """One line per weakness the audit found in v0: the field that trains
+        against it and its value, `MATI` when that field is 0 (printed by
+        train_zipformer.sh before a run starts)."""
+        lines = []
+        for field, weakness, detail in ROBUSTNESS_AUGMENTATION:
+            value = getattr(self, field)
+            state = f"{field}={value:g}" + "".join(f" {d}={getattr(self, d)}" for d in detail) if value > 0 else "MATI"
+            lines.append(f"  {weakness:<52} {state}")
+        return lines
+
     @classmethod
     def from_yaml(cls, yaml_path: str | Path) -> "ZipformerTrainConfig":
-        """Load the configuration from a YAML file."""
+        """Load the configuration from a YAML file.
+
+        A key this code does not know is an error: pydantic would drop it, and a
+        run would train without the augmentation its config asks for (a typo, or
+        a config newer than the checked-out code).
+        """
         with open(yaml_path, encoding="utf-8") as f:
-            return cls(**yaml.safe_load(f))
+            data = yaml.safe_load(f)
+        unknown = sorted(set(data) - set(cls.model_fields))
+        if unknown:
+            raise ValueError(
+                f"{yaml_path}: unknown config keys {unknown}; this code would ignore them "
+                "(a typo, or a config written for a newer version of the pipeline)"
+            )
+        return cls(**data)
 
     def to_yaml(self, yaml_path: str | Path) -> None:
         """Save the configuration to a YAML file (plain lists, no python tags)."""

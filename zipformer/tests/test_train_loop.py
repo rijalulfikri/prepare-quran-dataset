@@ -420,12 +420,17 @@ def test_evaluate_sets_caps_only_the_legacy_dev(monkeypatch, tiny_cfg):
         calls.append(max_cuts)
         return {"per_phonemes": 0.1, "silence_per": None, "num_speech": 1, "num_silence": 0}
 
+    waves = []
     monkeypatch.setattr(tl, "evaluate_split", fake_split)
-    monkeypatch.setattr(tl, "eval_dataloader", lambda cfg, cuts: object())
-    m = tl.evaluate_sets(None, tiny_cfg, {"dev": None, "qdat": None}, None, CPU)
-    assert calls == [tiny_cfg.dev_max_cuts, None]
+    monkeypatch.setattr(tl, "eval_dataloader", lambda cfg, cuts, wave_transforms=None: waves.append(wave_transforms))
+    sets = {"dev": None, "qdat": None, "dev_unseen_clip": None}
+    m = tl.evaluate_sets(None, tiny_cfg, sets, None, CPU)
+    assert calls == [tiny_cfg.dev_max_cuts, None, None]
     assert m == {"per_phonemes": 0.1, "silence_per": None, "num_speech": 1, "num_silence": 0,
-                 "qdat/per_phonemes": 0.1, "qdat/num_speech": 1}
+                 "qdat/per_phonemes": 0.1, "qdat/num_speech": 1,
+                 "dev_unseen_clip/per_phonemes": 0.1, "dev_unseen_clip/num_speech": 1}
+    # only the clip stress set gets a waveform function
+    assert [len(w) for w in waves] == [0, 0, 1]
 
 
 # ---------------------------------------------------------------- CR-CTC and joined segments
@@ -479,6 +484,38 @@ def test_run_training_end_to_end_with_cr_ctc_and_concat(tiny_cfg, tiny_data_dir_
     # CR-CTC adds no parameters: the averaged model loads into a plain model
     model = build_model(cfg, vocab_size=44)
     model.load_state_dict(torch.load(avg, map_location="cpu", weights_only=False)["model"])
+
+
+ROBUST_AUG = {
+    "concat_p": 0.5, "concat_gap_seconds": (0.2, 0.6), "concat_max_seconds": 3.0,
+    "pad_p": 0.5, "pad_lead_seconds": (0.2, 0.6), "pad_trail_seconds": (0.0, 0.3),
+    "clip_p": 0.5, "tempo_p": 1.0, "tempo_range": (1.1, 1.3), "volume_p": 0.5, "reverb_p": 0.3,
+}
+
+
+@pytest.mark.parametrize("use_cr_ctc", [False, True])
+def test_run_training_end_to_end_with_the_robustness_augmentation(tiny_cfg, tiny_data_dir_concat, tokens, use_cr_ctc):
+    cfg = tiny_cfg.model_copy(update={**ROBUST_AUG, "use_cr_ctc": use_cr_ctc, "cr_warm_steps": 2})
+    avg = tl.run_training(cfg, tiny_data_dir_concat, tokens, CPU)
+    row = json.loads((Path(cfg.output_dir) / "dev_metrics.jsonl").read_text().splitlines()[0])
+    assert row["epoch"] == 1 and row["batch_idx_train"] > 0
+    model = build_model(cfg, vocab_size=44)
+    model.load_state_dict(torch.load(avg, map_location="cpu", weights_only=False)["model"])
+
+
+def test_tempo_reaches_the_loss_with_shorter_features(tiny_cfg, tiny_data_dir_big, tokens, tiny_model, monkeypatch):
+    seen = []
+    real = tl.compute_ctc_loss
+
+    def spy(model, feats, feat_lens, targets, target_lengths):
+        seen.append((feats.shape[1], int(feat_lens.max())))
+        return real(model, feats, feat_lens, targets, target_lengths)
+
+    monkeypatch.setattr(tl, "compute_ctc_loss", spy)
+    cfg = tiny_cfg.model_copy(update={"tempo_p": 1.0, "tempo_range": (1.25, 1.25), "speed_perturb": False})
+    _run_epoch(cfg, tiny_data_dir_big, tokens, tiny_model, max_batches=3)
+    # one-second cuts: 100 fbank frames, 80 at tempo 1.25
+    assert seen and all(shape == (80, 80) for shape in seen)
 
 
 def test_frame_budget_counts_joined_cuts(tiny_cfg, tiny_data_dir_concat, tokens):

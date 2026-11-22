@@ -144,8 +144,44 @@ def read_env_keys(env_path):
     return values
 
 
+def unknown_config_keys(config_keys, config_py_source):
+    """Key config yang bukan field `ZipformerTrainConfig` di `config_py_source` (isi config.py).
+
+    Pydantic membuang key yang tidak dikenal tanpa pesan. Jika config lokal lebih
+    baru daripada kode yang di-clone box (mis. field augmentasi baru, branch belum
+    di-push), training berjalan tanpa augmentasi itu dan tidak ada yang gagal.
+    """
+    fields = set(re.findall(r"^ {4}(\w+)\s*:", config_py_source, flags=re.MULTILINE))
+    return sorted(k for k in config_keys if k not in fields)
+
+
+def check_config_matches_commit(config, commit, branch, dry_run=False):
+    """Gagal jika `config` (dict dari --config) memuat key yang tidak dikenal kode di `commit`."""
+    shown = subprocess.run(
+        ["git", "show", f"{commit}:zipformer/quran_zipformer/config.py"],
+        cwd=REPO_ROOT, capture_output=True, text=True,
+    )
+    if shown.returncode != 0:
+        print(f"PERINGATAN: commit {commit[:7]} belum ada di lokal (git fetch), jadi key --config "
+              "tidak bisa dicek terhadap kode yang akan dilatih.")
+        return
+    unknown = unknown_config_keys(config, shown.stdout)
+    if not unknown:
+        return
+    print(f"Error: --config memuat key yang tidak dikenal kode di origin/{branch} ({commit[:7]}): "
+          f"{', '.join(unknown)}")
+    print("  Kode itu akan mengabaikannya tanpa pesan, sehingga training berjalan tanpa fitur tersebut.")
+    print(f"  Push commit yang memuat field itu (git push origin {branch}) atau pilih --branch yang benar.")
+    if not dry_run:
+        sys.exit(1)
+
+
 def check_local_config(config_path):
-    """Pastikan --config ada dan YAML valid, lalu cetak field yang menentukan run mana yang dilanjutkan."""
+    """Pastikan --config ada dan YAML valid, lalu cetak field yang menentukan run mana yang dilanjutkan.
+
+    Returns:
+        dict | None: isi config, atau None jika PyYAML tidak ada di lokal.
+    """
     if not os.path.isfile(config_path):
         print(f"Error: --config {config_path} tidak ditemukan.")
         sys.exit(1)
@@ -153,7 +189,7 @@ def check_local_config(config_path):
         import yaml
     except ImportError:
         print(f"PERINGATAN: paket PyYAML tidak ada di lokal; {config_path} tidak divalidasi sebelum dikirim.")
-        return
+        return None
     try:
         with open(config_path, encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
@@ -166,6 +202,7 @@ def check_local_config(config_path):
     print(f"Config lokal {config_path} akan dipakai di box:")
     for key in RUN_IDENTITY_FIELDS:
         print(f"  {key}: {cfg.get(key)}")
+    return cfg
 
 
 def resolve_box(args):
@@ -273,8 +310,7 @@ def wait_for_ssh(ssh, timeout=SSH_READY_TIMEOUT, interval=15):
 
 def check_local_prerequisites(args):
     """Validasi rclone.conf, .env, K2_WHEEL_URL, --config, dan commit yang akan di-clone box."""
-    if args.config:
-        check_local_config(args.config)
+    local_config = check_local_config(args.config) if args.config else None
     if not os.path.isfile(args.rclone_conf):
         print(f"Error: {args.rclone_conf} tidak ditemukan. Konfigurasi rclone dulu (README bagian 2).")
         sys.exit(1)
@@ -323,6 +359,10 @@ def check_local_prerequisites(args):
             print(f"Error: commit {remote_head[:7]} di GitHub tidak berisi zipformer/train_zipformer.sh "
                   f"(atau belum di-fetch). Push dulu: git push origin {args.branch}")
             sys.exit(1)
+    # Config lokal bisa lebih baru daripada kode yang di-clone box; key yang tidak dikenal
+    # kode itu dibuang tanpa pesan (lihat unknown_config_keys)
+    if local_config is not None:
+        check_config_matches_commit(local_config, remote_head, args.branch, args.dry_run)
 
 
 def build_train_command(args):
