@@ -73,6 +73,19 @@ class ZipformerTrainConfig(BaseModel):
     reverb_p: float = 0.0  # simulated-RIR reverb, before the noise mix
     volume_p: float = 0.0  # gain drawn uniformly in dB, after the noise mix
     volume_db: tuple[float, float] = (-30.0, 6.0)
+    # Consecutive segments of one sura joined into one training cut (the app hears
+    # continuous recitation); a run starts at a cut with probability concat_p
+    concat_p: float = 0.0
+    concat_segments: tuple[int, int] = (2, 4)  # segments per joined cut, drawn uniformly
+    concat_gap_seconds: tuple[float, float] = (0.0, 0.0)  # extra silence at each join
+
+    # --- loss ---
+    # CR-CTC (icefall): two SpecAugment views of each batch, CTC on both plus a
+    # consistency KL between them. No new parameters: checkpoints and export are unchanged
+    use_cr_ctc: bool = False
+    cr_loss_scale: float = 0.2
+    cr_time_mask_ratio: float = 2.5  # time masking x this, as the icefall recipe
+    cr_warm_steps: int = 2000  # cr_loss_scale ramps up linearly over these batches
 
     # --- per-epoch evaluation sets (defaults: legacy dev only) ---
     dev_unseen_cuts_per_moshaf: int = 0  # fixed sample of cuts_test per test moshaf; 0 = off
@@ -130,7 +143,15 @@ class ZipformerTrainConfig(BaseModel):
         return self
 
     def _validate_augmentation(self) -> None:
-        for name in ("reverb_p", "volume_p", "cutmix_p"):
+        low, high = self.concat_segments
+        if not 2 <= low <= high:
+            raise ValueError(f"concat_segments must be (low, high) with 2 <= low <= high, got {(low, high)}")
+        low, high = self.concat_gap_seconds
+        if not 0 <= low <= high:
+            raise ValueError(f"concat_gap_seconds must be (low, high) with 0 <= low <= high, got {(low, high)}")
+        if self.cr_loss_scale < 0 or self.cr_time_mask_ratio <= 0 or self.cr_warm_steps < 1:
+            raise ValueError("cr_loss_scale must be >= 0, cr_time_mask_ratio > 0 and cr_warm_steps >= 1")
+        for name in ("reverb_p", "volume_p", "cutmix_p", "concat_p"):
             if not 0 <= getattr(self, name) <= 1:
                 raise ValueError(f"{name} must be in [0, 1]")
         for name in ("volume_db", "cutmix_snr"):

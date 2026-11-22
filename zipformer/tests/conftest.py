@@ -156,11 +156,13 @@ def make_cut_in_memory():
     return _make
 
 
-def _build_data_dir(root, num_speech, seconds, speech_specs=None):
+def _build_data_dir(root, num_speech, seconds, speech_specs=None, segment_indices=None):
     """Data dir in Task 4's layout: `seconds`-long FLACs under `root/audio/...` and
     `cuts_{train,dev,noise_aug}.jsonl.gz` manifests with relative paths.
 
-    `speech_specs` (list of `(seconds, text)`) replaces the default speech cuts."""
+    `speech_specs` (list of `(seconds, text)`) replaces the default speech cuts;
+    `segment_indices` (one `"SSS.NNNN"` per speech cut) adds data prep's
+    `moshaf_id` / `segment_index` custom fields to them."""
     import io
 
     import numpy as np
@@ -180,14 +182,16 @@ def _build_data_dir(root, num_speech, seconds, speech_specs=None):
         sf.write(buf, wav.astype("float32"), 16000, format="WAV")
         return write_flac(buf.getvalue(), root / rel)
 
-    def cut(rel, text, cut_id, input_type, secs=seconds):
-        return make_cut(rel, flac(rel, secs), text, cut_id, {"input_type": input_type}, root)
+    def cut(rel, text, cut_id, input_type, secs=seconds, custom=None):
+        return make_cut(rel, flac(rel, secs), text, cut_id, {"input_type": input_type, **(custom or {})}, root)
 
     if speech_specs is None:
         speech_specs = [(seconds, "ءَلِف"[: 1 + i % 4]) for i in range(num_speech)]
+    segs = segment_indices or [None] * len(speech_specs)
     train = [
-        cut(f"audio/moshaf_6.0/{i}.flac", text, f"moshaf_6.0__{i}", "speech", secs)
-        for i, (secs, text) in enumerate(speech_specs)
+        cut(f"audio/moshaf_6.0/{i}.flac", text, f"moshaf_6.0__{i}", "speech", secs,
+            seg and {"moshaf_id": "6.0", "segment_index": seg})
+        for i, ((secs, text), seg) in enumerate(zip(speech_specs, segs))
     ]
     train.append(cut("audio/noise/000000.flac", "", "noise__000000", "silence"))
     noise_aug = [
@@ -317,6 +321,19 @@ def make_tiny_model(tiny_cfg_factory):
 @pytest.fixture
 def tiny_model(make_tiny_model):
     return make_tiny_model()
+
+
+# sura 1 positions 1..20 without 8 (a hole: 7 and 9 are not adjacent), sura 2 positions 1..21
+CONCAT_SEGMENTS = [f"001.{p:04d}" for p in range(1, 21) if p != 8] + [f"002.{p:04d}" for p in range(1, 22)]
+
+
+@pytest.fixture(scope="session")
+def tiny_data_dir_concat(tmp_path_factory):
+    """40 one-second speech cuts with segment indices (`CONCAT_SEGMENTS`) and one silence cut."""
+    return _build_data_dir(
+        tmp_path_factory.mktemp("tiny_data_concat"), num_speech=len(CONCAT_SEGMENTS), seconds=1,
+        segment_indices=CONCAT_SEGMENTS,
+    )
 
 
 @pytest.fixture(scope="session")

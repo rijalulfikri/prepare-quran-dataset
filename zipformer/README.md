@@ -193,6 +193,36 @@ Tidak dikerjakan:
 * Tempo: `PerturbTempo` Lhotse memakai `torchaudio.sox_effects`, yang tidak ada lagi di torchaudio 2.9+ (sudah dicek di 2.11). Rentang speed yang lebih lebar menggantikannya.
 * Geser pitch: `torchaudio.functional.pitch_shift` butuh ±0,36 detik per klip 12 detik (1 thread). Pada p 0,3 itu ±5 detik per batch per worker, setara dengan anggaran ±5,8 detik per batch per worker (24 worker, ±0,24 detik per langkah GPU), sehingga data loader akan menjadi leher botol. Gema pada p 0,3 hanya menambah ±0,3 detik per batch per worker (±19 ms per klip).
 
+### Gabungan segmen dan CR-CTC (run pembanding, mati di v1)
+
+Dua opsi tambahan, keduanya mati secara bawaan dan juga di `train_config.yml`, supaya v1 tetap mengukur augmentasi di atas saja. Nyalakan di run terpisah lalu bandingkan `dev_metrics.jsonl`-nya dengan v1.
+
+**Gabungan segmen berurutan** (`concat_p`, `concat_segments`, `concat_gap_seconds`). Aplikasi mendengar bacaan bersambung, sedangkan data latih berisi potongan per jeda. `concat_consecutive` menggabungkan 2–4 segmen yang berurutan (moshaf dan surah sama, `segment_index` bersebelahan) menjadi satu cut. Labelnya adalah label segmen yang disambung tanpa pemisah; tiap label sudah berakhir dalam bentuk waqf, sesuai yang dibaca karena segmen dipotong di jeda qari. Segmen yang digabung menggantikan aslinya, jadi audio per epoch tetap sama. Pengelompokan diambil dari `seed` atas urutan (moshaf, surah, posisi), sehingga sama di setiap epoch dan proses, tidak bergantung pada urutan manifest, dan resume tetap tepat. Salinan speed, cek frame CTC, gema, CutMix, dan gain dikenakan pada cut gabungan. Manifest tidak menyimpan stempel waktu, jadi panjang jeda asli tidak bisa dipulihkan. Segmen moshaf 6.0 sudah membawa ±0,5 detik hening di tiap ujung, sedangkan moshaf 19.0 tidak; `concat_gap_seconds` menambah hening di tiap sambungan (bawaan 0). Cut gabungan bisa mencapai empat kali panjang segmen terpanjang. Encoder kausal dengan konteks kiri terbatas membuat memorinya linear terhadap durasi, tetapi batch berisi lebih sedikit cut.
+
+**CR-CTC** (`use_cr_ctc`, `cr_loss_scale`, `cr_time_mask_ratio`, `cr_warm_steps`), mengikuti `forward_cr_ctc` icefall:
+
+* time warp sekali;
+* batch digandakan;
+* tiap salinan mendapat SpecAugment sendiri dengan masking waktu ×2,5;
+* loss = CTC rata-rata kedua salinan + skala × KL konsistensi antara keduanya.
+
+Skala naik linear dari 0 ke `cr_loss_scale` (0,2) selama `cr_warm_steps` batch. SpecAugment dataset dimatikan selama CR-CTC aktif, karena masking dipasang di loop training. Tidak ada parameter baru, jadi checkpoint, rata-rata, ekspor ONNX, dan eval tidak berubah. W&B/TensorBoard mencatat `train/ctc_loss` dan `train/cr_loss` di samping `train/loss`.
+
+Encoder menghitung dua kali per batch. Resep icefall memakai `max_duration` setengah dari biasanya, jadi waktu per epoch kira-kira 1,6–2× v1.
+
+Resep run pembanding (mis. v1b):
+
+```bash
+cp configs/train_config.yml configs/train_config_v1b.yml
+# ubah di salinan: semua nama run v1 -> v1b (output_dir, rclone_checkpoint_path,
+#   hub_model_id, wandb_project_name), lalu
+#   use_cr_ctc: true
+#   max_duration: 300
+#   concat_p: 0.3          # opsional; tanpa ini yang diukur hanya CR-CTC
+```
+
+Untuk memisahkan efek keduanya, jalankan CR-CTC dan gabungan segmen di run yang berbeda.
+
 ### Baseline checkpoint lama
 
 Angka v0 pada set baru, tanpa training, dengan `configs/eval_baseline_v0.yml` (dimensi model dan eval set sama dengan `train_config.yml`, `output_dir` sendiri):

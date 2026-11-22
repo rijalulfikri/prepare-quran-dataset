@@ -426,3 +426,66 @@ def test_evaluate_sets_caps_only_the_legacy_dev(monkeypatch, tiny_cfg):
     assert calls == [tiny_cfg.dev_max_cuts, None]
     assert m == {"per_phonemes": 0.1, "silence_per": None, "num_speech": 1, "num_silence": 0,
                  "qdat/per_phonemes": 0.1, "qdat/num_speech": 1}
+
+
+# ---------------------------------------------------------------- CR-CTC and joined segments
+
+
+def _cr_inputs(tokens):
+    feats = torch.randn(2, 120, 80)
+    lens = torch.tensor([120, 100])
+    tgt, tgt_lens = tl.encode_targets(["بب", "ب"], tokens, CPU)
+    segments = torch.tensor([[0, 0, 120], [1, 0, 100]], dtype=torch.int32)
+    return feats, lens, tgt, tgt_lens, segments
+
+
+@pytest.mark.parametrize("batch_idx, scale", [(0, 0.0), (1000, 0.1), (2000, 0.2), (5000, 0.2)])
+def test_cr_ctc_loss_is_finite_and_warms_up(tiny_model, tokens, cfg, batch_idx, scale):
+    from quran_zipformer.datamodule import cr_spec_augment
+
+    cfg = cfg.model_copy(update={"use_cr_ctc": True})
+    feats, lens, tgt, tgt_lens, segments = _cr_inputs(tokens)
+    loss, n, parts = tl.compute_cr_ctc_loss(
+        tiny_model, feats, lens, tgt, tgt_lens, segments, cr_spec_augment(cfg), batch_idx, cfg
+    )
+    assert torch.isfinite(loss) and int(n) == 220  # frames of one view: the two views are averaged
+    assert set(parts) == {"ctc", "cr"} and parts["cr"] >= 0
+    assert loss.item() == pytest.approx(parts["ctc"] + scale * parts["cr"], rel=1e-5)
+    loss.backward()  # gradients flow through both views
+
+
+def test_cr_ctc_training_uses_the_cr_loss_only_when_on(tiny_cfg, tiny_data_dir_big, tokens, tiny_model, monkeypatch):
+    calls = []
+    real = tl.compute_cr_ctc_loss
+    monkeypatch.setattr(tl, "compute_cr_ctc_loss", lambda *a, **k: calls.append(1) or real(*a, **k))
+    _run_epoch(tiny_cfg, tiny_data_dir_big, tokens, tiny_model, max_batches=2)
+    assert not calls  # default: plain CTC
+
+    def boom(*a, **k):
+        raise AssertionError("plain CTC must not run with use_cr_ctc")
+
+    monkeypatch.setattr(tl, "compute_ctc_loss", boom)
+    cfg = tiny_cfg.model_copy(update={"use_cr_ctc": True})
+    st = _run_epoch(cfg, tiny_data_dir_big, tokens, tiny_model, max_batches=2)
+    assert len(calls) == 2 and st.batch_idx_train == 2
+
+
+def test_run_training_end_to_end_with_cr_ctc_and_concat(tiny_cfg, tiny_data_dir_concat, tokens):
+    cfg = tiny_cfg.model_copy(update={"use_cr_ctc": True, "concat_p": 0.5, "cr_warm_steps": 2})
+    avg = tl.run_training(cfg, tiny_data_dir_concat, tokens, CPU)
+    assert avg.exists()
+    row = json.loads((Path(cfg.output_dir) / "dev_metrics.jsonl").read_text().splitlines()[0])
+    assert row["epoch"] == 1 and row["batch_idx_train"] > 0
+    # CR-CTC adds no parameters: the averaged model loads into a plain model
+    model = build_model(cfg, vocab_size=44)
+    model.load_state_dict(torch.load(avg, map_location="cpu", weights_only=False)["model"])
+
+
+def test_frame_budget_counts_joined_cuts(tiny_cfg, tiny_data_dir_concat, tokens):
+    from quran_zipformer.datamodule import concat_consecutive, load_cuts
+
+    cfg = tiny_cfg.model_copy(update={"concat_p": 1.0})
+    train, _ = tl.apply_frame_budget(cfg, tiny_data_dir_concat)
+    units = concat_consecutive(cfg, train)
+    assert len(units) < len(train)  # joined cuts are built from the returned train cuts
+    assert len(train) == len(load_cuts(tiny_data_dir_concat, "train"))

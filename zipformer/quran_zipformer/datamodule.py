@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Literal
 
 import lhotse
+import torch
 from lhotse import CutSet, Fbank, FbankConfig, MonoCut
 from lhotse.dataset import (
     CutMix,
@@ -88,10 +89,101 @@ def speed_copies(cfg: ZipformerTrainConfig, cuts: CutSet) -> tuple[list[MonoCut]
     return kept, dropped
 
 
+def _segment_key(cut) -> tuple[str, int, int] | None:
+    """`(moshaf, sura, position)` from the data-prep custom fields (`segment_index`
+    is `"SSS.NNNN"`); None for silence cuts and cuts without a parseable index."""
+    custom = cut.supervisions[0].custom or {}
+    if custom.get("input_type") != "speech":
+        return None
+    try:
+        sura, pos = str(custom["segment_index"]).split(".")
+        return str(custom["moshaf_id"]), int(sura), int(pos)
+    except (KeyError, ValueError):
+        return None
+
+
+def _join(group: list, gaps: list[float]):
+    """One cut playing `group` back to back (plus `gaps` of silence) with a single
+    supervision whose text is the labels joined without separator.
+
+    Each label already ends in its waqf form, which is what the reciter said:
+    the segments were cut at his pauses.
+    """
+    from lhotse.utils import fastcopy
+
+    joined = group[0]
+    for gap, nxt in zip(gaps, group[1:]):
+        if gap > 0:
+            joined = joined.pad(duration=joined.duration + gap, direction="right")
+        joined = joined.append(fastcopy(nxt, supervisions=[]))
+    text = "".join(fb._text(c) for c in group)
+    first = joined.tracks[0]
+    sup = group[0].supervisions[0]
+    custom = {
+        **(sup.custom or {}),
+        "num_labels": len(text),
+        "num_repeats": fb.count_repeats(text),
+        "concat": len(group),
+    }
+    new_id = f"{group[0].id}_cat{len(group)}"
+    # one supervision on the first track spanning the whole joined cut
+    # (lhotse's merge_supervisions would give it a synthetic recording id and channel)
+    sup = fastcopy(sup, id=new_id, start=0.0, duration=joined.duration, text=text, custom=custom)
+    tracks = [fastcopy(first, cut=fastcopy(first.cut, supervisions=[sup])), *joined.tracks[1:]]
+    return fastcopy(joined, id=new_id, tracks=tracks)
+
+
+def concat_consecutive(cfg: ZipformerTrainConfig, cuts: CutSet) -> CutSet:
+    """`cuts` with runs of consecutive segments (same moshaf and sura, adjacent
+    positions) joined into one cut; identity when `concat_p` is 0.
+
+    Walks the speech cuts in (moshaf, sura, position) order with one RNG seeded
+    from `cfg.seed`, so the groups do not depend on manifest order and are the
+    same in every epoch, process and resume. A run starts at a cut with
+    probability `concat_p` and is as long as the next adjacent segments allow,
+    up to a length drawn from `concat_segments`; joined segments replace the
+    originals, so an epoch keeps (nearly) the same audio. Output: the joined
+    and untouched cuts in manifest order of each group's first cut.
+    """
+    if cfg.concat_p <= 0:
+        return cuts
+    rng = random.Random(f"{cfg.seed}:concat")
+    cut_list = list(cuts)  # iterate once: a lazy CutSet need not repeat its order
+    keyed = sorted((k, i) for i, c in enumerate(cut_list) if (k := _segment_key(c)) is not None)
+    groups: dict[int, list[int]] = {}  # first index -> member indices
+    consumed: set[int] = set()
+    j = 0
+    while j < len(keyed):
+        (moshaf, sura, pos), i = keyed[j]
+        run = [i]
+        if rng.random() < cfg.concat_p:
+            want = rng.randint(*cfg.concat_segments)
+            while len(run) < want and j + len(run) < len(keyed):
+                (m2, s2, p2), i2 = keyed[j + len(run)]
+                if (m2, s2, p2) != (moshaf, sura, pos + len(run)):
+                    break
+                run.append(i2)
+        if len(run) > 1:
+            groups[i] = run
+            consumed.update(run)
+        j += len(run)
+    out = []
+    for i, cut in enumerate(cut_list):
+        if i in groups:
+            members = [cut_list[m] for m in groups[i]]
+            gap_rng = random.Random(f"{cfg.seed}:concat_gap:{cut.id}")
+            gaps = [round(gap_rng.uniform(*cfg.concat_gap_seconds), 2) for _ in members[1:]]
+            out.append(_join(members, gaps))
+        elif i not in consumed:
+            out.append(cut)
+    return CutSet.from_cuts(out)
+
+
 def _train_cuts(
     cfg: ZipformerTrainConfig, data_dir: Path, cuts: CutSet | None = None
 ) -> CutSet:
-    """Training cuts (`cuts` or the train manifest), one static copy per speed range.
+    """Training cuts (`cuts` or the train manifest), consecutive segments joined
+    (`concat_consecutive`), then one static copy per speed range.
 
     The CutSet is fixed before batching (factors come from `copy_factors`), so
     batch durations respect `max_duration` and the sampler order, hence resume,
@@ -102,7 +194,7 @@ def _train_cuts(
     first in every epoch.
     """
     base = cuts if cuts is not None else load_cuts(data_dir, "train")
-    kept, _ = speed_copies(cfg, base)
+    kept, _ = speed_copies(cfg, concat_consecutive(cfg, base))
     combined = CutSet.from_cuts(kept)
     if not cfg.speed_perturb:
         return combined
@@ -217,7 +309,8 @@ def _dataset(
     if train and cfg.volume_p > 0:
         transforms.append(RandomGainDb(cfg.volume_p, cfg.volume_db))
     input_transforms = []
-    if train:
+    # with CR-CTC the loss masks two views of each batch itself (cr_spec_augment)
+    if train and not cfg.use_cr_ctc:
         input_transforms.append(  # icefall's defaults
             SpecAugment(
                 time_warp_factor=80,
@@ -233,6 +326,27 @@ def _dataset(
         input_transforms=input_transforms,
         return_cuts=True,
     )
+
+
+def cr_spec_augment(cfg: ZipformerTrainConfig) -> SpecAugment:
+    """SpecAugment for the two CR-CTC views (icefall `get_spec_augment`): no time
+    warp (applied once before the batch is duplicated) and `cr_time_mask_ratio`
+    times the time masking."""
+    return SpecAugment(
+        time_warp_factor=0,
+        num_frame_masks=int(10 * cfg.cr_time_mask_ratio),
+        features_mask_size=27,
+        num_feature_masks=2,
+        frames_mask_size=100,
+        max_frames_mask_fraction=0.15 * cfg.cr_time_mask_ratio,
+    )
+
+
+def supervision_segments(batch: dict) -> Tensor:
+    """`(N, 3)` int tensor `[sequence_idx, start_frame, num_frames]` per supervision
+    (the layout icefall's `time_warp` expects)."""
+    sups = batch["supervisions"]
+    return torch.stack([sups["sequence_idx"], sups["start_frame"], sups["num_frames"]], dim=1)
 
 
 def _ignore_stop_signals(worker_id: int) -> None:

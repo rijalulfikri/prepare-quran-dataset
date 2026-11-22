@@ -299,3 +299,117 @@ def test_sampler_resume_is_exact_with_v1_augmentation(tiny_data_dir_big, cfg, wo
         assert got == ref
     else:
         assert [sorted(b) for b in got] == [sorted(b) for b in ref]
+
+
+# ---------------------------------------------------------------- consecutive segments joined
+
+
+def _seg(cut):
+    return cut.supervisions[0].custom["segment_index"]
+
+
+def _parts(cut):
+    """Ids of the segments a (possibly joined) cut plays, in order."""
+    if type(cut).__name__ != "MixedCut":
+        return [cut.id]
+    return [t.cut.id for t in cut.tracks if type(t.cut).__name__ == "MonoCut"]
+
+
+def test_concat_off_is_identity(tiny_data_dir_concat, cfg):
+    cuts = dm.load_cuts(tiny_data_dir_concat, "train")
+    assert dm.concat_consecutive(cfg, cuts) is cuts
+
+
+def test_concat_joins_only_adjacent_segments_of_one_sura(tiny_data_dir_concat, cfg):
+    cfg = cfg.model_copy(update={"concat_p": 1.0, "concat_segments": (2, 4)})
+    base = dm.load_cuts(tiny_data_dir_concat, "train")
+    text = {c.id: c.supervisions[0].text for c in base}
+    seg = {c.id: (_seg(c) if "segment_index" in c.supervisions[0].custom else None) for c in base}
+    out = list(dm.concat_consecutive(cfg, base))
+    joined = [c for c in out if type(c).__name__ == "MixedCut"]
+    assert joined and len(out) < len(base)
+    covered = []
+    for c in out:
+        ids = _parts(c)
+        covered += ids
+        if len(ids) > 1:
+            assert 2 <= len(ids) <= 4
+            keys = [tuple(int(x) for x in seg[i].split(".")) for i in ids]
+            assert len({s for s, _ in keys}) == 1  # one sura
+            assert [p for _, p in keys] == list(range(keys[0][1], keys[0][1] + len(ids)))  # adjacent
+            assert len(c.supervisions) == 1
+            sup = c.supervisions[0]
+            assert sup.text == "".join(text[i] for i in ids)  # no separator
+            assert (sup.start, sup.duration) == (0.0, pytest.approx(c.duration))
+            assert sup.custom["num_labels"] == len(sup.text) and sup.custom["concat"] == len(ids)
+    assert sorted(covered) == sorted(text)  # every cut once, silence untouched
+    assert not any({seg[i] for i in _parts(c)} >= {"001.0007", "001.0009"} for c in joined)
+
+
+def test_concat_is_deterministic_and_independent_of_manifest_order(tiny_data_dir_concat, cfg):
+    cfg = cfg.model_copy(update={"concat_p": 0.5})
+    base = dm.load_cuts(tiny_data_dir_concat, "train")
+    a = sorted(c.id for c in dm.concat_consecutive(cfg, base))
+    b = sorted(c.id for c in dm.concat_consecutive(cfg, base.shuffle(rng=random.Random(3))))
+    assert a == b == sorted(c.id for c in dm.concat_consecutive(cfg, base))
+    assert a != sorted(c.id for c in dm.concat_consecutive(cfg.model_copy(update={"seed": 7}), base))
+
+
+def test_concat_gap_adds_silence_between_segments(tiny_data_dir_concat, cfg):
+    cfg = cfg.model_copy(update={"concat_p": 1.0, "concat_segments": (2, 2), "concat_gap_seconds": (0.3, 0.3)})
+    c = next(c for c in dm.concat_consecutive(cfg, dm.load_cuts(tiny_data_dir_concat, "train"))
+             if type(c).__name__ == "MixedCut")
+    assert c.duration == pytest.approx(2.3)
+    assert c.load_audio().shape[-1] == round(2.3 * 16000)
+
+
+def test_concat_cuts_go_through_speed_copies_and_the_loader(tiny_data_dir_concat, cfg):
+    cfg = cfg.model_copy(update={"concat_p": 0.5, "reverb_p": 0.5, "volume_p": 0.5, "cutmix_p": 0.5,
+                                 "speed_factor_ranges": [(0.85, 0.95), (1.0, 1.0), (1.05, 1.25)]})
+    cfg.num_workers = 0
+    cfg.max_duration = 8
+    cuts = dm._train_cuts(cfg, tiny_data_dir_concat)
+    assert any("_cat" in c.id and "_sp" in c.id for c in cuts)
+    texts = []
+    for batch in dm.train_dataloader(cfg, tiny_data_dir_concat, epoch=1):
+        feats, lens, t, bcuts = dm.batch_to_tensors(batch)
+        assert len(t) == len(bcuts) == feats.shape[0]
+        texts += t
+    assert max(len(t) for t in texts) > 4  # joined labels reach the batches
+
+
+@pytest.mark.parametrize("workers", [0, 2])
+def test_sampler_resume_is_exact_with_concat(tiny_data_dir_concat, cfg, workers):
+    cfg = cfg.model_copy(update={"concat_p": 0.5, "cutmix_p": 0.0})
+    cfg.num_workers = workers
+    cfg.max_duration = 4
+    ref = [_ids(b) for b in dm.train_dataloader(cfg, tiny_data_dir_concat, epoch=1)]
+    assert len(ref) >= 6 and any("_cat" in i for b in ref for i in b)
+    loader = dm.train_dataloader(cfg, tiny_data_dir_concat, epoch=1)
+    it = iter(loader)
+    consumed = [_ids(next(it)) for _ in range(3)]
+    state = loader.sampler.state_dict()
+    del it, loader
+    resumed = dm.train_dataloader(cfg, tiny_data_dir_concat, epoch=1, sampler_state=state, batches_consumed=3)
+    assert consumed + [_ids(b) for b in resumed] == ref
+
+
+# ---------------------------------------------------------------- CR-CTC
+
+
+def test_cr_ctc_moves_specaugment_out_of_the_dataset(tiny_data_dir, cfg):
+    cfg = cfg.model_copy(update={"use_cr_ctc": True})
+    cfg.num_workers = 0
+    assert dm.train_dataloader(cfg, tiny_data_dir).dataset.input_transforms == []
+    sa = dm.cr_spec_augment(cfg)
+    assert (sa.time_warp_factor, sa.num_frame_masks, sa.max_frames_mask_fraction) == (0, 25, pytest.approx(0.375))
+
+
+def test_supervision_segments_layout(tiny_data_dir, cfg):
+    cfg.num_workers = 0
+    cfg.max_duration = 10
+    batch = next(iter(dm.train_dataloader(cfg, tiny_data_dir)))
+    seg = dm.supervision_segments(batch)
+    n = len(batch["supervisions"]["text"])
+    assert seg.shape == (n, 3)
+    assert seg[:, 0].tolist() == batch["supervisions"]["sequence_idx"].tolist()

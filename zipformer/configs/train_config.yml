@@ -87,6 +87,14 @@ cutmix_snr: [5.0, 20.0]        # v0: [10, 20]
 reverb_p: 0.3                  # simulated-RIR reverb on the speech, before the noise mix
 volume_p: 0.5                  # gain uniform in dB, after the noise mix (quiet microphone)
 volume_db: [-30.0, 6.0]
+# joined consecutive segments and CR-CTC: off in v1, for a separate comparison run (README)
+concat_p: 0.0                  # chance a run of consecutive segments of one sura starts at a cut
+concat_segments: [2, 4]        # segments per joined cut
+concat_gap_seconds: [0.0, 0.0] # extra silence at each join
+use_cr_ctc: false              # two SpecAugment views + consistency loss; ~2x compute per batch
+cr_loss_scale: 0.2
+cr_time_mask_ratio: 2.5
+cr_warm_steps: 2000
 
 # ---- per-epoch eval sets (one dev_metrics.jsonl row per epoch, see README) ----
 dev_unseen_cuts_per_moshaf: 1000   # fixed sample of cuts_test (moshaf 19.0, 29.0, 30.0)

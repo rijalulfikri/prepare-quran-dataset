@@ -38,10 +38,13 @@ from quran_zipformer import frame_budget as fb
 from quran_zipformer.config import ZipformerTrainConfig
 from quran_zipformer.datamodule import (
     batch_to_tensors,
+    concat_consecutive,
+    cr_spec_augment,
     eval_dataloader,
     load_cuts,
     speed_copies,
     speed_ranges,
+    supervision_segments,
     train_dataloader,
 )
 from quran_zipformer.decode import evaluate_split
@@ -113,6 +116,32 @@ def compute_ctc_loss(model, feats: Tensor, feat_lens: Tensor, targets: Tensor, t
     enc, enc_lens = model.forward_encoder(feats, feat_lens)
     loss = model.forward_ctc(enc, enc_lens, targets, target_lengths)
     return loss, feat_lens.sum()
+
+
+CR_TIME_WARP_FACTOR = 80  # the dataset's SpecAugment value, applied once before duplicating
+
+
+def compute_cr_ctc_loss(
+    model, feats: Tensor, feat_lens: Tensor, targets: Tensor, target_lengths: Tensor,
+    segments: Tensor, spec_augment, batch_idx_train: int, cfg: ZipformerTrainConfig,
+) -> tuple[Tensor, Tensor, dict[str, float]]:
+    """`(loss_sum, num_frames, parts)` of CR-CTC, as icefall's `AsrModel.forward` with
+    `use_cr_ctc=True` and a CTC-only model.
+
+    Time warp once, duplicate the batch, mask each copy independently, CTC on both
+    copies plus the KL consistency between their outputs. Both terms are halved
+    (two copies); the consistency scale ramps up over `cr_warm_steps` batches.
+    `parts` holds the two terms for logging.
+    """
+    from icefall.utils import time_warp
+
+    x = time_warp(feats, time_warp_factor=CR_TIME_WARP_FACTOR, supervision_segments=segments)
+    x = spec_augment(x.repeat(2, 1, 1))
+    enc, enc_lens = model.forward_encoder(x, feat_lens.repeat(2))
+    ctc, cr = model.forward_cr_ctc(enc, enc_lens, targets.repeat(2), target_lengths.repeat(2))
+    ctc, cr = ctc * 0.5, cr * 0.5
+    scale = min(batch_idx_train / cfg.cr_warm_steps, 1.0) * cfg.cr_loss_scale
+    return ctc + scale * cr, feat_lens.sum(), {"ctc": ctc.item(), "cr": cr.item()}
 
 
 # ------------------------------------------------------------------ optimizer / state
@@ -292,7 +321,8 @@ def apply_frame_budget(cfg: ZipformerTrainConfig, data_dir: Path) -> tuple[CutSe
     """
     factor = cfg.output_downsampling_factor
     train, raw_dev = load_cuts(data_dir, "train"), load_cuts(data_dir, "dev")
-    _, dropped_train = speed_copies(cfg, train)
+    units = concat_consecutive(cfg, train)  # the cuts the speed copies are made of
+    _, dropped_train = speed_copies(cfg, units)
     dev, dropped_dev = fb.filter_feasible(raw_dev, factor, 1.0)
     out = Path(cfg.output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -300,7 +330,7 @@ def apply_frame_budget(cfg: ZipformerTrainConfig, data_dir: Path) -> tuple[CutSe
     (out / "dropped_cuts.json").write_text(
         json.dumps({"factor": factor, "speed_factor_ranges": ranges, "train": dropped_train, "dev": dropped_dev}, indent=2)
     )
-    num_copies = len(ranges) * sum(not fb._is_silence(c) for c in train)
+    num_copies = len(ranges) * sum(not fb._is_silence(c) for c in units)
     num_dev = sum(not fb._is_silence(c) for c in raw_dev)
     num_speech, num_dropped = num_copies + num_dev, len(dropped_train) + len(dropped_dev)
     fraction = num_dropped / num_speech if num_speech else 0.0
@@ -427,6 +457,7 @@ def _train_batches(
     """Train on `loader` (at most `max_batches`); True when the loader was exhausted."""
     model.train()
     autocast = cfg.bf16 and device.type == "cuda"
+    cr_spec_aug = cr_spec_augment(cfg) if cfg.use_cr_ctc else None
 
     def save_batch_ckpt() -> None:
         _check_finite_weights(model, st)
@@ -446,8 +477,15 @@ def _train_batches(
             feats, feat_lens, texts, cuts = batch_to_tensors(batch)
             feats, feat_lens = feats.to(device), feat_lens.to(device)
             targets, target_lengths = encode_targets(texts, tokens, device)
+            parts = {}
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast):
-                loss, num_frames = compute_ctc_loss(model, feats, feat_lens, targets, target_lengths)
+                if cfg.use_cr_ctc:
+                    loss, num_frames, parts = compute_cr_ctc_loss(
+                        model, feats, feat_lens, targets, target_lengths,
+                        supervision_segments(batch).to(device), cr_spec_aug, st.batch_idx_train, cfg,
+                    )
+                else:
+                    loss, num_frames = compute_ctc_loss(model, feats, feat_lens, targets, target_lengths)
             finite = bool(torch.isfinite(loss))
             if finite:
                 loss.backward()
@@ -470,6 +508,7 @@ def _train_batches(
                         "train/loss": loss.item() / max(int(num_frames), 1),
                         "train/lr": opt.param_groups[0]["lr"],
                         "train/epoch": st.epoch,
+                        **{f"train/{k}_loss": v / max(int(num_frames), 1) for k, v in parts.items()},
                     },
                     st.batch_idx_train,
                 )
