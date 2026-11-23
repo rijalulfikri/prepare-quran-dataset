@@ -71,6 +71,7 @@ Prasyarat:
 
 import argparse
 import functools
+import json
 import os
 import re
 import shlex
@@ -104,10 +105,16 @@ BOX_TZ = "WIB-7"
 REMOTE_TZ_FILE = "/root/zipformer_tz"
 # Batas bawah box: fbank/augmentasi berjalan on the fly di num_workers proses dataloader.
 # 2026-11-23: box 8 core / 30 GB RAM di-OOM-kill di epoch 1; 48 core / 108 GB memakai ~34 GB.
-MIN_RAM_GB = 64
-# nproc; batas memori cgroup v2, lalu v1; MemTotal host (byte)
+# 48 GiB, bukan 64: box yang tercantum "64 GB" di Vast.ai hanya terbaca ~62 GiB di container.
+MIN_RAM_GB = 48
+# Sisa masa sewa minimum: Vast.ai men-stop instance di end_date offer (2026-11-23 box
+# California berhenti di tengah epoch 11 karena sewanya hanya sampai siang itu).
+MIN_RENTAL_DAYS = 3
+# nproc (bisa = core host); kuota CPU cgroup v2 ("max 100000" = tanpa kuota);
+# batas memori cgroup v2, lalu v1; MemTotal host (byte)
 BOX_RESOURCES_PROBE = (
-    "nproc; cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null "
+    "nproc; cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo max 100000; "
+    "cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null "
     "|| echo max; awk '/MemTotal/ {print $2 * 1024}' /proc/meminfo"
 )
 DEFAULT_EARLY_STOP_MIN_IMPROVEMENT = 0.05
@@ -197,7 +204,9 @@ def config_num_workers(config_text):
 def parse_box_resources(probe_output):
     """(cpu, byte RAM yang boleh dipakai container) dari output BOX_RESOURCES_PROBE."""
     lines = [l.strip() for l in probe_output.strip().splitlines() if l.strip()]
-    cpus, limit, host_total = int(lines[0]), lines[1], int(float(lines[2]))
+    cpus, cpu_max, limit, host_total = int(lines[0]), lines[1].split(), lines[2], int(float(lines[3]))
+    if cpu_max[0].isdigit():
+        cpus = min(cpus, int(cpu_max[0]) // int(cpu_max[1]))
     mem = min(int(limit), host_total) if limit.isdigit() else host_total
     return cpus, mem
 
@@ -210,6 +219,58 @@ def resource_problems(cpus, mem_bytes, num_workers):
     if mem_bytes < MIN_RAM_GB * 2**30:
         problems.append(f"RAM box {mem_bytes / 2**30:.0f} GiB, kurang dari minimum {MIN_RAM_GB} GiB")
     return problems
+
+
+def offer_problems(offer, num_workers, now=None):
+    """Alasan offer Vast.ai tidak layak untuk training (list kosong = layak).
+
+    `offer` adalah satu baris `vastai search offers --raw`: end_date (epoch detik),
+    cpu_cores_effective, cpu_ram (MB).
+    """
+    now = time.time() if now is None else now
+    problems = []
+    end = offer.get("end_date")
+    if end and (end - now) / 86400 < MIN_RENTAL_DAYS:
+        problems.append(f"sisa masa sewa offer {(end - now) / 86400:.1f} hari, kurang dari {MIN_RENTAL_DAYS} hari "
+                        "(Vast.ai men-stop instance di end_date)")
+    cpus = offer.get("cpu_cores_effective") or 0
+    if num_workers and cpus < num_workers:
+        problems.append(f"offer hanya {cpus:.0f} CPU efektif, kurang dari num_workers {num_workers}")
+    ram_gib = (offer.get("cpu_ram") or 0) / 1024
+    if ram_gib < MIN_RAM_GB:
+        problems.append(f"RAM offer {ram_gib:.0f} GiB, kurang dari minimum {MIN_RAM_GB} GiB")
+    return problems
+
+
+def local_num_workers(args):
+    """num_workers dari --config atau config repo lokal (yang di-clone box dari GitHub)."""
+    config_path = args.config or os.path.join(SCRIPT_DIR, "..", "configs", "train_config.yml")
+    with open(config_path, encoding="utf-8") as f:
+        return config_num_workers(f.read())
+
+
+def check_new_instance(args, instance_id, get_instances, destroy_instance):
+    """Cek end_date/CPU/RAM instance yang baru dibuat dari --offer-id; hapus lagi jika di bawah patokan.
+
+    `vastai search offers 'id=<offer>'` tidak menemukan offer, jadi angkanya dibaca dari
+    instance itu sendiri (field yang sama dengan offer), sebelum setup apa pun berjalan.
+    """
+    inst = next((i for i in get_instances() or [] if i.get("id") == instance_id), None)
+    if inst is None:
+        print(f"PERINGATAN: instance {instance_id} tidak terbaca dari API; pengecekan sewa/CPU/RAM dilewati.")
+        return
+    problems = offer_problems(inst, local_num_workers(args))
+    if not problems:
+        return
+    for p in problems:
+        print(f"  - {p}")
+    if args.skip_resource_check:
+        print("PERINGATAN: --skip-resource-check: instance tetap dipakai.")
+        return
+    print(f"Error: offer {args.offer_id} tidak memenuhi patokan (README: Patokan box dan run Vast.ai); "
+          f"instance {instance_id} dihapus lagi. Pakai --skip-resource-check untuk tetap memakainya.")
+    destroy_instance(instance_id)
+    sys.exit(1)
 
 
 def check_local_config(config_path):
@@ -258,7 +319,7 @@ def resolve_box(args):
 
     # Import di sini supaya --host/--port tidak butuh paket vastai / VAST_API_KEY
     sys.path.insert(0, SCRIPT_DIR)
-    from vast_api import create_instance_with_ssh_info, get_first_started_instance
+    from vast_api import create_instance_with_ssh_info, destroy_instance, get_first_started_instance, get_instances
 
     if args.offer_id is not None:
         if args.dry_run:
@@ -277,6 +338,7 @@ def resolve_box(args):
             print("Cek https://cloud.vast.ai/instances/ ; hapus manual jika instance sempat dibuat.")
             sys.exit(1)
         print(f"Instance {info['instance_id']} dibuat: {info['ip']}:{info['ssh_port']}")
+        check_new_instance(args, info["instance_id"], get_instances, destroy_instance)
         return info["ip"], str(info["ssh_port"]), info["instance_id"], True
 
     label = args.label or os.getenv("VAST_LABEL")
@@ -547,9 +609,7 @@ def check_box_resources(ssh, args):
     except (ValueError, IndexError):
         print(f"PERINGATAN: CPU/RAM box tidak terbaca ({out.strip()!r}); pengecekan dilewati.")
         return
-    config_path = args.config or os.path.join(SCRIPT_DIR, "..", "configs", "train_config.yml")
-    with open(config_path, encoding="utf-8") as f:
-        num_workers = config_num_workers(f.read())
+    num_workers = local_num_workers(args)
     print(f"Box: {cpus} CPU, RAM {mem / 2**30:.0f} GiB; config num_workers {num_workers}, minimum RAM {MIN_RAM_GB} GiB")
     problems = resource_problems(cpus, mem, num_workers)
     if not problems:
@@ -561,7 +621,7 @@ def check_box_resources(ssh, args):
         return
     print("Error: box terlalu kecil untuk training ini (box 8 CPU / 30 GB pernah di-OOM-kill di epoch 1).")
     print("  Pilih offer dengan cpu_cores_effective >= num_workers dan cpu_ram >= "
-          f"{MIN_RAM_GB} GB, atau turunkan num_workers di config, atau --skip-resource-check.")
+          f"{MIN_RAM_GB} GiB, atau turunkan num_workers di config, atau --skip-resource-check.")
     sys.exit(1)
 
 
