@@ -155,3 +155,18 @@ def test_print_status_header_in_wib_for_a_wib_box(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "waktu box 2026-11-23 00:34:17 WIB," in out
     assert "  2026-11-23 00:27:10 WIB watchdog mulai" in out
+
+
+def test_gpu_summary_averages_the_samples_instead_of_one_snapshot():
+    # util, power.draw, power.limit, memory.used, memory.total (csv,noheader,nounits), one line per 0.5 s
+    lines = ["0, 76.12, 400.00, 22002, 32607", "93, 388.40, 400.00, 22002, 32607",
+             "97, 401.90, 400.00, 22002, 32607", "90, 384.51, 400.00, 22002, 32607"]
+    assert zs.gpu_summary(lines) == (
+        "rata-rata 70 % (0–97 %, 4 sampel dalam 2 s), daya rata-rata 313/400 W, memori 22002/32607 MiB"
+    )
+
+
+def test_gpu_summary_skips_junk_and_handles_no_gpu():
+    assert zs.gpu_summary([]) is None
+    assert zs.gpu_summary(["NVIDIA-SMI has failed", ""]) is None
+    assert zs.gpu_summary(["50, [N/A], [N/A], 100, 200"]).startswith("rata-rata 50 % (50–50 %, 1 sampel")

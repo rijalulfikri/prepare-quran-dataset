@@ -99,7 +99,8 @@ echo @@ERRORS; cur | tail -c 200000 | tr '\r' '\n' | grep -a 'Traceback\|Error\|
 echo @@STAGE; cur | tail -c 200000 | tr '\r' '\n' | grep -a 'INFO train_zipformer\|averaged\|test results\|all [0-9]* epochs already complete\|rebuilding training cuts' | tail -2
 echo @@WATCHDOG; tmux has-session -t watchdog 2>/dev/null && echo session; pgrep -f '^bash /root/zipformer_watchdog\.sh' >/dev/null && echo running; tail -3 /root/zipformer_watchdog.log 2>/dev/null
 echo @@WATCHDOG_PARAMS; grep -a -o 'patience [0-9]*, min relative improvement [0-9.]*\(, metric [^ ,]*\)\?' /root/zipformer_watchdog.log 2>/dev/null | tail -1
-echo @@GPU; nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader 2>/dev/null
+# utilisasi berfluktuasi 0-99 %% antar detik: 10 sampel tiap 0,5 s, dirata-rata di lokal (gpu_summary)
+echo @@GPU; timeout 5 nvidia-smi --query-gpu=utilization.gpu,power.draw,power.limit,memory.used,memory.total --format=csv,noheader,nounits -lms 500 2>/dev/null
 """
 
 
@@ -218,6 +219,29 @@ def to_wib(text, offset=timedelta(0)):
         t = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S") + WIB - offset
         return f"{t:%Y-%m-%d %H:%M:%S}{m.group(2) or ''} WIB"
     return _STAMP.sub(shift, text)
+
+
+GPU_SAMPLE_SECONDS = 0.5
+
+
+def gpu_summary(lines):
+    """Ringkasan sampel nvidia-smi (util, daya, batas daya, memori terpakai, total); None jika tidak ada."""
+    rows = []
+    for line in lines:
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) == 5 and parts[0].isdigit():
+            rows.append(parts)
+    if not rows:
+        return None
+    util = [int(r[0]) for r in rows]
+    out = (f"rata-rata {sum(util) / len(util):.0f} % ({min(util)}–{max(util)} %, "
+           f"{len(rows)} sampel dalam {len(rows) * GPU_SAMPLE_SECONDS:g} s)")
+    try:
+        power = [float(r[1]) for r in rows]
+        out += f", daya rata-rata {sum(power) / len(power):.0f}/{float(rows[-1][2]):.0f} W"
+    except ValueError:
+        pass  # daya [N/A] di sebagian GPU
+    return out + f", memori {rows[-1][3]}/{rows[-1][4]} MiB"
 
 
 def epoch_hours(epoch_end_lines):
@@ -390,8 +414,9 @@ def print_status(args, st):
     for l in wd:
         if l not in ("session", "running"):
             print(f"  {to_wib(l, off)}")
-    if first(s, "GPU"):
-        print(f"GPU: {first(s, 'GPU')}")
+    gpu = gpu_summary(s.get("GPU", []))
+    if gpu:
+        print(f"GPU: {gpu}")
     for key, label in (("STAGE", "Tahap terakhir"), ("ENDED", "Akhir run"), ("FINISH", "Upload/destroy"), ("ERRORS", "Error di log")):
         lines = [l for l in s.get(key, []) if l.strip()]
         if lines:
