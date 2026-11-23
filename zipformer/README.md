@@ -143,6 +143,7 @@ Patokan dari run v1 (2026-11-23). Ikuti ini untuk setiap run berikutnya; tiap ba
 |---|---|---|
 | GPU | 1× RTX 5090 32 GB (atau VRAM ≥ 32 GB) | `max_duration: 600` memakai ±22–30 GB VRAM |
 | **CPU** | `cpu_cores_effective` ≥ `num_workers` di config (24) | fbank, CutMix, speed perturb, reverb, dan noise dihitung on the fly di worker dataloader. Di box, `nproc` bisa menampilkan core host (mis. 192); yang berlaku kuota cgroup `cpu.max` (mis. 36,9), dan itulah yang dicek launcher |
+| **Kecepatan CPU per core** | `cpu_ghz` ≥ 3.4 (Zen 3/Zen 4/Ryzen 7000-9000, Xeon Sapphire Rapids) | proses utama Python berjalan 100 % di satu core (worker data loader justru banyak menganggur), jadi clock per core menentukan laju: EPYC 7K62 (Zen 2, `cpu_ghz` 2.6) hanya ±120 batch/menit dan GPU 44 %, dibanding ±221 batch/menit di box sebelumnya; satu epoch ±2 jam, bukan ±70 menit, dan biaya per epoch naik dari ±$0.81 ke ±$1.2 walau $/jam lebih murah |
 | **RAM** | ≥ 48 GiB (offer "64 GB" terbaca ±62 GiB, lolos) | box 8 core / 30 GB RAM di-OOM-kill (exit 137, `oom_kill` cgroup) 4 menit setelah epoch 1 dimulai; box 48 core / 108 GB memakai ±34 GB |
 | **Sisa masa sewa** | `end_date` offer ≥ 3 hari lagi (filter `duration>=3`) | Vast.ai men-stop instance tepat di `end_date`: box California run v1 berhenti di tengah epoch 11 (14:09 WIB) karena sewanya hanya sampai siang itu |
 | Disk | `--disk 110` cukup | data 65 GiB (tar dihapus setelah diekstrak) + environment + checkpoint (`keep_last_k: 3`): terpakai ±85 GB sampai epoch 4 |
@@ -156,11 +157,11 @@ Patokan dari run v1 (2026-11-23). Ikuti ini untuk setiap run berikutnya; tiap ba
 Mencari offer yang memenuhi patokan (urut harga):
 
 ```bash
-vastai search offers 'gpu_name=RTX_5090 num_gpus=1 reliability>0.98 verified=true rentable=true cuda_vers>=12.8 disk_space>=110 cpu_cores_effective>=24 cpu_ram>=50 inet_down>=500 duration>=3' -o 'dph_total' --storage 110
+vastai search offers 'gpu_name=RTX_5090 num_gpus=1 reliability>0.98 verified=true rentable=true cuda_vers>=12.8 disk_space>=110 cpu_cores_effective>=24 cpu_ram>=50 cpu_ghz>=3.4 inet_down>=500 duration>=3' -o 'dph_total' --storage 110
 python vastai/run_zipformer_training.py --offer-id <OFFER_ID> --disk 110 --destroy-when-done --early-stop-patience 4
 ```
 
-Launcher menegakkan CPU, RAM, dan sisa masa sewa: dengan `--offer-id`, instance yang baru dibuat langsung dicek (`end_date`, `cpu_cores_effective`, `cpu_ram` dari API) dan dihapus lagi sebelum setup jika di bawah patokan; di langkah [1/6] CPU (kuota cgroup) dan RAM container dicek lagi di box. `--skip-resource-check` melewati keduanya. Filter `id=<offer>` di `vastai search offers` tidak berfungsi, jadi offer tidak bisa dicek sebelum dibuat. Di query, `cpu_ram` dalam GB (`cpu_ram>=50`), sedangkan output `--raw` dalam MB; `cpu_ram>=50000` mengembalikan nol offer.
+Launcher menegakkan CPU, RAM, dan sisa masa sewa: dengan `--offer-id`, instance yang baru dibuat langsung dicek (`end_date`, `cpu_cores_effective`, `cpu_ram` dari API) dan dihapus lagi sebelum setup jika di bawah patokan; di langkah [1/6] CPU (kuota cgroup) dan RAM container dicek lagi di box. `--skip-resource-check` melewati keduanya. Filter `id=<offer>` di `vastai search offers` tidak berfungsi, jadi offer tidak bisa dicek sebelum dibuat. Di query, `cpu_ram` dalam GB (`cpu_ram>=50`), sedangkan output `--raw` dalam MB; `cpu_ram>=50000` mengembalikan nol offer. Data instance dari API tidak memuat `cpu_ghz`, jadi kecepatan CPU hanya tersaring lewat `cpu_ghz>=3.4` saat mencari offer; bandingkan juga laju batch/menit di epoch pertama box baru dengan box sebelumnya.
 
 Jika `--offer-id` gagal dengan "Unknown error", jalankan `vastai show instances`: instance bisa sudah terbuat dalam status `stopped` (GPU-nya keburu disewa orang lain) dan tetap ditagih storage; hapus dengan `vastai destroy instance <ID>` sebelum mencoba offer lain. Image pytorch tidak punya `unzip` (dibutuhkan installer rclone); launcher memasangnya di langkah [2/6].
 

@@ -17,7 +17,7 @@ python zipformer/vastai/zipformer_status.py --wait     # blocks until a new epoc
 
 It finds the instance through the Vast.ai API on every call. Prefer that over pinning `--host/--port`: a host's public IP can change mid-run (seen 2026-11-19), and the API lookup follows it. Its first line is `STATUS: <STATE>`; `--help` and the module docstring describe the rest. Reply to the user in their language.
 
-Box sizing, credit, and early-stop rules for a run (CPU ≥ `num_workers`, RAM ≥ 48 GiB, rental `end_date` ≥ 3 days away, reliability ≥ 0.99, on-demand) are in `zipformer/README.md` → "Patokan box dan run Vast.ai"; when asked to pick or switch a machine, apply them before comparing prices.
+Box sizing, credit, and early-stop rules for a run (CPU ≥ `num_workers`, CPU clock `cpu_ghz` ≥ 3.4, RAM ≥ 48 GiB, rental `end_date` ≥ 3 days away, reliability ≥ 0.99, on-demand) are in `zipformer/README.md` → "Patokan box dan run Vast.ai"; when asked to pick or switch a machine, apply them before comparing prices.
 
 ## Loop
 

@@ -110,6 +110,9 @@ MIN_RAM_GB = 48
 # Sisa masa sewa minimum: Vast.ai men-stop instance di end_date offer (2026-11-23 box
 # California berhenti di tengah epoch 11 karena sewanya hanya sampai siang itu).
 MIN_RENTAL_DAYS = 3
+# Proses utama training berjalan 100 % di satu core: clock per core menentukan kecepatan.
+# 2026-11-23: EPYC 7K62 (cpu_ghz 2.6) ±120 batch/menit, box sebelumnya ±221 batch/menit.
+MIN_CPU_GHZ = 3.4
 # nproc (bisa = core host); kuota CPU cgroup v2 ("max 100000" = tanpa kuota);
 # batas memori cgroup v2, lalu v1; MemTotal host (byte)
 BOX_RESOURCES_PROBE = (
@@ -236,6 +239,10 @@ def offer_problems(offer, num_workers, now=None):
     cpus = offer.get("cpu_cores_effective") or 0
     if num_workers and cpus < num_workers:
         problems.append(f"offer hanya {cpus:.0f} CPU efektif, kurang dari num_workers {num_workers}")
+    ghz = offer.get("cpu_ghz")
+    if ghz and ghz < MIN_CPU_GHZ:
+        problems.append(f"CPU {offer.get('cpu_name') or ''} {ghz:.1f} GHz, kurang dari {MIN_CPU_GHZ} GHz "
+                        "(proses utama training terikat kecepatan satu core)")
     ram_gib = (offer.get("cpu_ram") or 0) / 1024
     if ram_gib < MIN_RAM_GB:
         problems.append(f"RAM offer {ram_gib:.0f} GiB, kurang dari minimum {MIN_RAM_GB} GiB")

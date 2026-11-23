@@ -96,3 +96,14 @@ def test_new_instance_within_the_rules_is_kept():
     good = {**OK_OFFER, "id": 7, "end_date": time.time() + 30 * 86400}
     rzt.check_new_instance(_Args(), 7, lambda: [good], destroyed.append)
     assert destroyed == []
+
+
+def test_offer_with_a_slow_cpu_is_refused():
+    # 2026-11-23: EPYC 7K62 listed at 2.6 GHz trained ~1.7x slower (main process pinned at 100 % of one core)
+    problems = rzt.offer_problems({**OK_OFFER, "cpu_ghz": 2.6}, num_workers=24, now=NOW)
+    assert len(problems) == 1 and "GHz" in problems[0]
+
+
+def test_offer_with_a_fast_or_unlisted_cpu_passes():
+    assert rzt.offer_problems({**OK_OFFER, "cpu_ghz": 5.88}, num_workers=24, now=NOW) == []
+    assert rzt.offer_problems({**OK_OFFER, "cpu_ghz": None}, num_workers=24, now=NOW) == []
